@@ -179,6 +179,7 @@ interface PersistenceError {
 [Error]
 interface PsbtError {
   InvalidMagic();
+  FinalizeError();
   MissingUtxo();
   InvalidSeparator();
   PsbtUtxoOutOfBounds();
@@ -685,6 +686,9 @@ interface Psbt {
 
   [Throws=PsbtError]
   Psbt combine(Psbt other);
+
+  [Throws=PsbtError]
+  Psbt finalize();
 
   string json_serialize();
 };
