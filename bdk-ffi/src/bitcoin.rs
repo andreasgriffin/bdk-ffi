@@ -230,7 +230,7 @@ impl Psbt {
         let result = self.0.lock().unwrap().clone().finalize(&secp);
         match result {
             Ok(psbt) => Ok(Arc::new(Psbt::from(psbt))),
-            Err((_psbt, _errors)) => Err(PsbtError::FinalizeError),
+            Err((_psbt, _errors)) => Err(PsbtError::OtherPsbtErr),
         }
     }
 

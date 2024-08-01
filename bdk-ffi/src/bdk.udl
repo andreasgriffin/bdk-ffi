@@ -179,7 +179,6 @@ interface PersistenceError {
 [Error]
 interface PsbtError {
   InvalidMagic();
-  FinalizeError();
   MissingUtxo();
   InvalidSeparator();
   PsbtUtxoOutOfBounds();

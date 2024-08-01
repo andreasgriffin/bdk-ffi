@@ -429,9 +429,6 @@ pub enum PsbtError {
     #[error("invalid magic")]
     InvalidMagic,
 
-    #[error("finalize error with errors")]
-    FinalizeError,
-
     #[error("UTXO information is not present in PSBT")]
     MissingUtxo,
 
