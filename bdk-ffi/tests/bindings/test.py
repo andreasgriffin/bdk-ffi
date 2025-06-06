@@ -1,8 +1,10 @@
+from bdkpython.bitcoin import Network
+
 import unittest
-from bdk import *
 
 class TestBdk(unittest.TestCase):
 
+    # A type from the bitcoin-ffi library
     def test_some_enum(self):
         network = Network.TESTNET
 

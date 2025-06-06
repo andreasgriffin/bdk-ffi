@@ -12,13 +12,13 @@ pip install bdkpython
 
 ## Simple example
 ```python
-import bdkpython as bdk
+from bdkpython import Wallet
 ```
 """
 
 setup(
     name="bdkpython",
-    version="1.0.0a12.dev",
+    version="2.0.0.dev0",
     description="The Python language bindings for the Bitcoin Development Kit",
     long_description=LONG_DESCRIPTION,
     long_description_content_type="text/markdown",

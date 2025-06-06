@@ -1,14 +1,14 @@
 name: Publish bdk-android to Maven Central
 on: [workflow_dispatch]
 
-# The default Android NDK on the ubuntu-22.04 image is 25.2.9519653
+# The default Android NDK on the ubuntu-24.04 image is 25.2.9519653
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     steps:
       - name: "Check out PR branch"
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: "Cache"
         uses: actions/cache@v3
@@ -20,21 +20,15 @@ jobs:
           key: ${{ runner.os }}-${{ hashFiles('**/Cargo.toml','**/Cargo.lock') }}
 
       - name: "Set up JDK"
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
-      - name: "Set default Rust version to 1.77.1"
-        run: rustup default 1.77.1
-
-      - name: "Install Rust Android targets"
-        run: rustup target add x86_64-linux-android aarch64-linux-android armv7-linux-androideabi
-
       - name: "Build bdk-android library"
         run: |
           cd bdk-android
-          ./gradlew buildAndroidLib
+          bash ./scripts/build-linux-x86_64.sh
 
       - name: "Publish to Maven Central"
         env:

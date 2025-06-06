@@ -3,6 +3,7 @@
  * and that a program that depends on them will run.
  */
 
-import org.bitcoindevkit.*
+import org.bitcoindevkit.bitcoin.Network
 
+// A type from bitcoin-ffi
 val network = Network.TESTNET

@@ -26,18 +26,40 @@ final class OfflinePersistenceTests: XCTestCase {
     }
 
     func testPersistence() throws {
-        let sqliteStore = try! SqliteStore(path: dbFilePath.path)
-        let initialChangeSet = try! sqliteStore.read()
-        let wallet = try Wallet.newOrLoad(
+        let persister = try Persister.newSqlite(path: dbFilePath.path)
+        let wallet = try Wallet.load(
             descriptor: descriptor,
             changeDescriptor: changeDescriptor,
-            changeSet: initialChangeSet,
-            network: .signet
+            persister: persister
         )
         let nextAddress: AddressInfo = wallet.revealNextAddress(keychain: KeychainKind.external)
         print("Address: \(nextAddress)")
 
         XCTAssertTrue(nextAddress.address.description == "tb1qan3lldunh37ma6c0afeywgjyjgnyc8uz975zl2")
         XCTAssertTrue(nextAddress.index == 7)
+    }
+
+    func testPersistenceWithDescriptor() throws {
+        let persister = try Persister.newSqlite(path: dbFilePath.path)
+        
+        let descriptorPub = try Descriptor(
+            descriptor: "wpkh([9122d9e0/84'/1'/0']tpubDCYVtmaSaDzTxcgvoP5AHZNbZKZzrvoNH9KARep88vESc6MxRqAp4LmePc2eeGX6XUxBcdhAmkthWTDqygPz2wLAyHWisD299Lkdrj5egY6/0/*)#zpaanzgu",
+            network: Network.signet
+        )
+        let changeDescriptorPub = try Descriptor(
+            descriptor: "wpkh([9122d9e0/84'/1'/0']tpubDCYVtmaSaDzTxcgvoP5AHZNbZKZzrvoNH9KARep88vESc6MxRqAp4LmePc2eeGX6XUxBcdhAmkthWTDqygPz2wLAyHWisD299Lkdrj5egY6/1/*)#n4cuwhcy",
+            network: Network.signet
+        )
+        
+        let wallet = try Wallet.load(
+            descriptor: descriptorPub,
+            changeDescriptor: changeDescriptorPub,
+            persister: persister
+        )
+        let nextAddress: AddressInfo = wallet.revealNextAddress(keychain: KeychainKind.external)
+        print("Address: \(nextAddress)")
+        
+        XCTAssertEqual(nextAddress.index, 7)
+        XCTAssertEqual(nextAddress.address.description, "tb1qan3lldunh37ma6c0afeywgjyjgnyc8uz975zl2")
     }
 }

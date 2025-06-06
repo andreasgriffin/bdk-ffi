@@ -4,9 +4,9 @@ import org.junit.Test
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.runner.RunWith
-import java.io.File
 import kotlin.test.AfterTest
 import kotlin.test.assertTrue
+import java.io.File
 
 private const val SIGNET_ESPLORA_URL = "http://signet.bitcoindevkit.net"
 private const val TESTNET_ESPLORA_URL = "https://esplora.testnet.kuutamo.cloud"
@@ -15,8 +15,8 @@ private const val TESTNET_ESPLORA_URL = "https://esplora.testnet.kuutamo.cloud"
 class LiveWalletTest {
     private val persistenceFilePath = InstrumentationRegistry
         .getInstrumentation().targetContext.filesDir.path + "/bdk_persistence2.sqlite"
-    private val descriptor: Descriptor = Descriptor("wpkh(tprv8ZgxMBicQKsPf2qfrEygW6fdYseJDDrVnDv26PH5BHdvSuG6ecCbHqLVof9yZcMoM31z9ur3tTYbSnr1WBqbGX97CbXcmp5H6qeMpyvx35B/84h/1h/0h/0/*)", Network.SIGNET)
-    private val changeDescriptor: Descriptor = Descriptor("wpkh(tprv8ZgxMBicQKsPf2qfrEygW6fdYseJDDrVnDv26PH5BHdvSuG6ecCbHqLVof9yZcMoM31z9ur3tTYbSnr1WBqbGX97CbXcmp5H6qeMpyvx35B/84h/1h/0h/1/*)", Network.SIGNET)
+    private val descriptor: Descriptor = Descriptor("wpkh(tprv8ZgxMBicQKsPf2qfrEygW6fdYseJDDrVnDv26PH5BHdvSuG6ecCbHqLVof9yZcMoM31z9ur3tTYbSnr1WBqbGX97CbXcmp5H6qeMpyvx35B/84h/1h/1h/0/*)", Network.SIGNET)
+    private val changeDescriptor: Descriptor = Descriptor("wpkh(tprv8ZgxMBicQKsPf2qfrEygW6fdYseJDDrVnDv26PH5BHdvSuG6ecCbHqLVof9yZcMoM31z9ur3tTYbSnr1WBqbGX97CbXcmp5H6qeMpyvx35B/84h/1h/1h/1/*)", Network.SIGNET)
 
     @AfterTest
     fun cleanup() {
@@ -28,9 +28,10 @@ class LiveWalletTest {
 
     @Test
     fun testSyncedBalance() {
-        val wallet: Wallet = Wallet(descriptor, changeDescriptor, Network.SIGNET)
+        var conn: Persister = Persister.newInMemory()
+        val wallet: Wallet = Wallet(descriptor, changeDescriptor, Network.SIGNET, conn)
         val esploraClient: EsploraClient = EsploraClient(SIGNET_ESPLORA_URL)
-        val fullScanRequest: FullScanRequest = wallet.startFullScan()
+        val fullScanRequest: FullScanRequest = wallet.startFullScan().build()
         val update = esploraClient.fullScan(fullScanRequest, 10uL, 1uL)
         wallet.applyUpdate(update)
         println("Balance: ${wallet.balance().total.toSat()}")
@@ -46,16 +47,17 @@ class LiveWalletTest {
         for (tx in transactions) {
             val sentAndReceived = wallet.sentAndReceived(tx.transaction)
             println("Transaction: ${tx.transaction.computeTxid()}")
-            println("Sent ${sentAndReceived.sent}")
-            println("Received ${sentAndReceived.received}")
+            println("Sent ${sentAndReceived.sent.toSat()}")
+            println("Received ${sentAndReceived.received.toSat()}")
         }
     }
 
     @Test
     fun testBroadcastTransaction() {
-        val wallet = Wallet(descriptor, changeDescriptor, Network.SIGNET)
+        var conn: Persister = Persister.newInMemory()
+        val wallet = Wallet(descriptor, changeDescriptor, Network.SIGNET, conn)
         val esploraClient = EsploraClient(SIGNET_ESPLORA_URL)
-        val fullScanRequest: FullScanRequest = wallet.startFullScan()
+        val fullScanRequest: FullScanRequest = wallet.startFullScan().build()
         val update = esploraClient.fullScan(fullScanRequest, 10uL, 1uL)
         wallet.applyUpdate(update)
         println("Balance: ${wallet.balance().total.toSat()}")

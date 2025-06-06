@@ -1,16 +1,17 @@
 import XCTest
 @testable import BitcoinDevKit
+import Darwin
 
 private let SIGNET_ESPLORA_URL = "http://signet.bitcoindevkit.net"
 private let TESTNET_ESPLORA_URL = "https://esplora.testnet.kuutamo.cloud"
 
 final class LiveWalletTests: XCTestCase {
     private let descriptor = try! Descriptor(
-    descriptor: "wpkh(tprv8ZgxMBicQKsPf2qfrEygW6fdYseJDDrVnDv26PH5BHdvSuG6ecCbHqLVof9yZcMoM31z9ur3tTYbSnr1WBqbGX97CbXcmp5H6qeMpyvx35B/84h/1h/0h/0/*)", 
+    descriptor: "wpkh(tprv8ZgxMBicQKsPf2qfrEygW6fdYseJDDrVnDv26PH5BHdvSuG6ecCbHqLVof9yZcMoM31z9ur3tTYbSnr1WBqbGX97CbXcmp5H6qeMpyvx35B/84h/1h/1h/0/*)", 
     network: Network.signet
     )
     private let changeDescriptor = try! Descriptor(
-        descriptor: "wpkh(tprv8ZgxMBicQKsPf2qfrEygW6fdYseJDDrVnDv26PH5BHdvSuG6ecCbHqLVof9yZcMoM31z9ur3tTYbSnr1WBqbGX97CbXcmp5H6qeMpyvx35B/84h/1h/0h/1/*)", 
+        descriptor: "wpkh(tprv8ZgxMBicQKsPf2qfrEygW6fdYseJDDrVnDv26PH5BHdvSuG6ecCbHqLVof9yZcMoM31z9ur3tTYbSnr1WBqbGX97CbXcmp5H6qeMpyvx35B/84h/1h/1h/1/*)", 
         network: Network.signet
     )
     var dbFilePath: URL!
@@ -35,20 +36,27 @@ final class LiveWalletTests: XCTestCase {
     }
 
     func testSyncedBalance() throws {
+        let persister = try Persister.newInMemory()
         let wallet = try Wallet(
             descriptor: descriptor,
             changeDescriptor: changeDescriptor,
-            network: .signet
+            network: .signet,
+            persister: persister
         )
         let esploraClient = EsploraClient(url: SIGNET_ESPLORA_URL)
-        let fullScanRequest: FullScanRequest = wallet.startFullScan()
+        let fullScanRequest: FullScanRequest = try wallet.startFullScan().build()
         let update = try esploraClient.fullScan(
-            fullScanRequest: fullScanRequest,
+            request: fullScanRequest,
             stopGap: 10,
             parallelRequests: 1
         )
         try wallet.applyUpdate(update: update)
         let address = wallet.revealNextAddress(keychain: KeychainKind.external).address.description
+
+        print("testSyncedBalance - Before balance assertion. Address: \(address)")
+        print("testSyncedBalance - Before balance assertion. Wallet Balance: \(wallet.balance()))")
+        print("testSyncedBalance - Before balance assertion. Wallet Balance Total To Sat: \(wallet.balance().total.toSat())")
+        fflush(stdout)
 
         XCTAssertGreaterThan(
             wallet.balance().total.toSat(),
@@ -67,21 +75,27 @@ final class LiveWalletTests: XCTestCase {
     }
     
     func testBroadcastTransaction() throws {
+        let persister = try Persister.newInMemory()
         let wallet = try Wallet(
             descriptor: descriptor,
             changeDescriptor: changeDescriptor,
-            network: .signet
+            network: .signet,
+            persister: persister
         )
         let esploraClient = EsploraClient(url: SIGNET_ESPLORA_URL)
-        let fullScanRequest: FullScanRequest = wallet.startFullScan()
+        let fullScanRequest: FullScanRequest = try wallet.startFullScan().build()
         let update = try esploraClient.fullScan(
-            fullScanRequest: fullScanRequest,
+            request: fullScanRequest,
             stopGap: 10,
             parallelRequests: 1
         )
         try wallet.applyUpdate(update: update)
         let address = wallet.revealNextAddress(keychain: KeychainKind.external).address.description
         
+        print("testBroadcastTransaction - Before balance assertion. Address: \(address)")
+        print("testBroadcastTransaction - Before balance assertion. Wallet Balance: \(wallet.balance()))")
+        print("testBroadcastTransaction - Before balance assertion. Wallet Balance Total To Sat: \(wallet.balance().total.toSat())")
+        fflush(stdout)
         XCTAssertGreaterThan(
             wallet.balance().total.toSat(),
             UInt64(0),
@@ -93,8 +107,8 @@ final class LiveWalletTests: XCTestCase {
         let recipient: Address = try Address(address: "tb1qrnfslnrve9uncz9pzpvf83k3ukz22ljgees989", network: .signet)
         let psbt: Psbt = try
             TxBuilder()
-            .addRecipient(script: recipient.scriptPubkey(), amount: Amount.fromSat(fromSat: 4200))
-                .feeRate(feeRate: FeeRate.fromSatPerVb(satPerVb: 2))
+            .addRecipient(script: recipient.scriptPubkey(), amount: Amount.fromSat(satoshi: 4200))
+                .feeRate(feeRate: FeeRate.fromSatPerVb(satVb: 2))
                 .finish(wallet: wallet)
 
         print(psbt.serialize())
@@ -106,7 +120,7 @@ final class LiveWalletTests: XCTestCase {
         let tx: Transaction = try! psbt.extractTx()
         print(tx.computeTxid())
         let fee: Amount = try wallet.calculateFee(tx: tx)
-        print("Transaction Fee: \(fee)")
+        print("Transaction Fee: \(fee.toSat())")
         let feeRate: FeeRate = try wallet.calculateFeeRate(tx: tx)
         print("Transaction Fee Rate: \(feeRate.toSatPerVbCeil()) sat/vB")
 

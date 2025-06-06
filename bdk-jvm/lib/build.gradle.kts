@@ -10,9 +10,8 @@ plugins {
     id("org.gradle.java-library")
     id("org.gradle.maven-publish")
     id("org.gradle.signing")
-
-    // Custom plugin to generate the native libs and bindings file
-    id("org.bitcoindevkit.plugins.generate-jvm-bindings")
+    id("org.jetbrains.dokka")
+    id("org.jetbrains.dokka-javadoc")
 }
 
 java {
@@ -20,6 +19,12 @@ java {
     targetCompatibility = JavaVersion.VERSION_11
     withSourcesJar()
     withJavadocJar()
+}
+
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
+    kotlinOptions {
+        jvmTarget = "11"
+    }
 }
 
 // This block ensures that the tests that require access to a blockchain are not
@@ -34,6 +39,7 @@ tasks.test {
         exclude("**/LiveTransactionTest.class")
         exclude("**/LiveTxBuilderTest.class")
         exclude("**/LiveWalletTest.class")
+        exclude("**/LiveKyotoTest.class")
     }
 }
 
@@ -56,16 +62,8 @@ tasks.withType<Test> {
 }
 
 dependencies {
-    implementation(platform("org.jetbrains.kotlin:kotlin-bom"))
-    implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk7")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
     implementation("net.java.dev.jna:jna:5.14.0")
-    api("org.slf4j:slf4j-api:1.7.30")
-
-    // testImplementation("org.junit.jupiter:junit-jupiter-api:5.10.1")
-    // testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.10.1")
-    // testRuntimeOnly("org.junit.vintage:junit-vintage-engine:5.8.2")
-    testImplementation("ch.qos.logback:logback-classic:1.2.3")
-    testImplementation("ch.qos.logback:logback-core:1.2.3")
 }
 
 afterEvaluate {
@@ -121,12 +119,20 @@ signing {
     sign(publishing.publications)
 }
 
-// This task dependency ensures that we build the bindings
-// binaries before running the tests
-tasks.withType<KotlinCompile> {
-    dependsOn("buildJvmLib")
-
-    kotlinOptions {
-        jvmTarget = "11"
+dokka {
+    moduleName.set("bdk-jvm")
+    moduleVersion.set(libraryVersion)
+    dokkaSourceSets.main {
+        includes.from("README.md")
+        sourceLink {
+            localDirectory.set(file("src/main/kotlin"))
+            remoteUrl("https://bitcoindevkit.org/")
+            remoteLineSuffix.set("#L")
+        }
+    }
+    pluginsConfiguration.html {
+        // customStyleSheets.from("styles.css")
+        // customAssets.from("logo.svg")
+        footerMessage.set("(c) Bitcoin Dev Kit Developers")
     }
 }

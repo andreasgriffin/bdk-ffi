@@ -1,39 +1,88 @@
-use crate::error::SqliteError;
+use crate::error::PersistenceError;
 use crate::types::ChangeSet;
 
-use bdk_sqlite::rusqlite::Connection;
-use bdk_sqlite::{Store as BdkSqliteStore, Store};
-use bdk_wallet::chain::ConfirmationTimeHeightAnchor;
-use bdk_wallet::KeychainKind;
+use bdk_wallet::{rusqlite::Connection as BdkConnection, WalletPersister};
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::ops::DerefMut;
+use std::sync::{Arc, Mutex};
 
-pub struct SqliteStore(Mutex<BdkSqliteStore<KeychainKind, ConfirmationTimeHeightAnchor>>);
+/// Definition of a wallet persistence implementation.
+#[uniffi::export(with_foreign)]
+pub trait Persistence: Send + Sync {
+    /// Initialize the total aggregate `ChangeSet` for the underlying wallet.
+    fn initialize(&self) -> Result<Arc<ChangeSet>, PersistenceError>;
 
-impl SqliteStore {
-    pub fn new(path: String) -> Result<Self, SqliteError> {
-        let connection = Connection::open(path)?;
-        let db = Store::new(connection)?;
-        Ok(Self(Mutex::new(db)))
+    /// Persist a `ChangeSet` to the total aggregate changeset of the wallet.
+    fn persist(&self, changeset: Arc<ChangeSet>) -> Result<(), PersistenceError>;
+}
+
+pub(crate) enum PersistenceType {
+    Custom(Arc<dyn Persistence>),
+    Sql(Mutex<BdkConnection>),
+}
+
+/// Wallet backend implementations.
+#[derive(uniffi::Object)]
+pub struct Persister {
+    pub(crate) inner: Mutex<PersistenceType>,
+}
+
+#[uniffi::export]
+impl Persister {
+    /// Create a new Sqlite connection at the specified file path.
+    #[uniffi::constructor]
+    pub fn new_sqlite(path: String) -> Result<Self, PersistenceError> {
+        let conn = BdkConnection::open(path)?;
+        Ok(Self {
+            inner: PersistenceType::Sql(conn.into()).into(),
+        })
     }
 
-    pub(crate) fn get_store(
-        &self,
-    ) -> MutexGuard<BdkSqliteStore<KeychainKind, ConfirmationTimeHeightAnchor>> {
-        self.0.lock().expect("sqlite store")
+    /// Create a new connection in memory.
+    #[uniffi::constructor]
+    pub fn new_in_memory() -> Result<Self, PersistenceError> {
+        let conn = BdkConnection::open_in_memory()?;
+        Ok(Self {
+            inner: PersistenceType::Sql(conn.into()).into(),
+        })
     }
 
-    pub fn write(&self, changeset: &ChangeSet) -> Result<(), SqliteError> {
-        self.get_store()
-            .write(&changeset.0)
-            .map_err(SqliteError::from)
+    /// Use a native persistence layer.
+    #[uniffi::constructor]
+    pub fn custom(persistence: Arc<dyn Persistence>) -> Self {
+        Self {
+            inner: PersistenceType::Custom(persistence).into(),
+        }
+    }
+}
+
+impl WalletPersister for PersistenceType {
+    type Error = PersistenceError;
+
+    fn initialize(persister: &mut Self) -> Result<bdk_wallet::ChangeSet, Self::Error> {
+        match persister {
+            PersistenceType::Sql(ref conn) => {
+                let mut lock = conn.lock().unwrap();
+                let deref = lock.deref_mut();
+                Ok(BdkConnection::initialize(deref)?)
+            }
+            PersistenceType::Custom(any) => any
+                .initialize()
+                .map(|changeset| changeset.as_ref().clone().into()),
+        }
     }
 
-    pub fn read(&self) -> Result<Option<Arc<ChangeSet>>, SqliteError> {
-        self.get_store()
-            .read()
-            .map_err(SqliteError::from)
-            .map(|optional_bdk_change_set| optional_bdk_change_set.map(ChangeSet::from))
-            .map(|optional_change_set| optional_change_set.map(Arc::new))
+    fn persist(persister: &mut Self, changeset: &bdk_wallet::ChangeSet) -> Result<(), Self::Error> {
+        match persister {
+            PersistenceType::Sql(ref conn) => {
+                let mut lock = conn.lock().unwrap();
+                let deref = lock.deref_mut();
+                Ok(BdkConnection::persist(deref, changeset)?)
+            }
+            PersistenceType::Custom(any) => {
+                let ffi_changeset: ChangeSet = changeset.clone().into();
+                any.persist(Arc::new(ffi_changeset))
+            }
+        }
     }
 }

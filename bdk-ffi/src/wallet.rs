@@ -1,105 +1,320 @@
-use crate::bitcoin::Amount;
-use crate::bitcoin::{FeeRate, OutPoint, Psbt, Script, Transaction};
+use crate::bitcoin::{Amount, FeeRate, OutPoint, Psbt, Script, Transaction, Txid};
 use crate::descriptor::Descriptor;
 use crate::error::{
-    CalculateFeeError, CannotConnectError, CreateTxError, SignerError, TxidParseError,
-    WalletCreationError,
+    CalculateFeeError, CannotConnectError, CreateWithPersistError, DescriptorError,
+    LoadWithPersistError, PersistenceError, SignerError, TxidParseError,
 };
+use crate::store::{PersistenceType, Persister};
 use crate::types::{
-    AddressInfo, Balance, CanonicalTx, ChangeSet, FullScanRequest, LocalOutput, ScriptAmount,
-    SyncRequest,
+    AddressInfo, Balance, BlockId, CanonicalTx, FullScanRequestBuilder, KeychainAndIndex,
+    LocalOutput, Policy, SentAndReceivedValues, SignOptions, SyncRequestBuilder, UnconfirmedTx,
+    Update,
 };
 
-use bdk_wallet::bitcoin::amount::Amount as BdkAmount;
 use bdk_wallet::bitcoin::Network;
-use bdk_wallet::bitcoin::Psbt as BdkPsbt;
-use bdk_wallet::bitcoin::ScriptBuf as BdkScriptBuf;
-use bdk_wallet::bitcoin::{OutPoint as BdkOutPoint, Sequence, Txid};
-use bdk_wallet::chain::{CombinedChangeSet, ConfirmationTimeHeightAnchor};
-use bdk_wallet::wallet::tx_builder::ChangeSpendPolicy;
-use bdk_wallet::wallet::Update as BdkUpdate;
-use bdk_wallet::Wallet as BdkWallet;
-use bdk_wallet::{KeychainKind, SignOptions};
+use bdk_wallet::signer::SignOptions as BdkSignOptions;
+use bdk_wallet::{KeychainKind, PersistedWallet, Wallet as BdkWallet};
 
-use std::collections::HashSet;
-use std::str::FromStr;
+use std::ops::DerefMut;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+/// A Bitcoin wallet.
+///
+/// The Wallet acts as a way of coherently interfacing with output descriptors and related transactions. Its main components are:
+/// 1. output descriptors from which it can derive addresses.
+/// 2. signers that can contribute signatures to addresses instantiated from the descriptors.
+///
+/// The user is responsible for loading and writing wallet changes which are represented as
+/// ChangeSets (see take_staged). Also see individual functions and example for instructions on when
+/// Wallet state needs to be persisted.
+///
+/// The Wallet descriptor (external) and change descriptor (internal) must not derive the same
+/// script pubkeys. See KeychainTxOutIndex::insert_descriptor() for more details.
+#[derive(uniffi::Object)]
 pub struct Wallet {
-    inner_mutex: Mutex<BdkWallet>,
+    inner_mutex: Mutex<PersistedWallet<PersistenceType>>,
 }
 
+#[uniffi::export]
 impl Wallet {
+    /// Build a new Wallet.
+    ///
+    /// If you have previously created a wallet, use load instead.
+    #[uniffi::constructor(default(lookahead = 25))]
     pub fn new(
         descriptor: Arc<Descriptor>,
         change_descriptor: Arc<Descriptor>,
         network: Network,
-    ) -> Result<Self, WalletCreationError> {
+        persister: Arc<Persister>,
+        lookahead: u32,
+    ) -> Result<Self, CreateWithPersistError> {
         let descriptor = descriptor.to_string_with_secret();
         let change_descriptor = change_descriptor.to_string_with_secret();
-        let wallet: BdkWallet = BdkWallet::new(&descriptor, &change_descriptor, network)?;
+        let mut persist_lock = persister.inner.lock().unwrap();
+        let deref = persist_lock.deref_mut();
+
+        let wallet: PersistedWallet<PersistenceType> =
+            BdkWallet::create(descriptor, change_descriptor)
+                .network(network)
+                .lookahead(lookahead)
+                .create_wallet(deref)
+                .map_err(|e| CreateWithPersistError::Persist {
+                    error_message: e.to_string(),
+                })?;
 
         Ok(Wallet {
             inner_mutex: Mutex::new(wallet),
         })
     }
 
-    pub fn new_or_load(
+    /// Build Wallet by loading from persistence.
+    //
+    // Note that the descriptor secret keys are not persisted to the db.
+    #[uniffi::constructor]
+    pub fn load(
         descriptor: Arc<Descriptor>,
         change_descriptor: Arc<Descriptor>,
-        change_set: Option<Arc<ChangeSet>>,
-        network: Network,
-    ) -> Result<Self, WalletCreationError> {
+        persister: Arc<Persister>,
+    ) -> Result<Wallet, LoadWithPersistError> {
         let descriptor = descriptor.to_string_with_secret();
         let change_descriptor = change_descriptor.to_string_with_secret();
-        let change_set: Option<CombinedChangeSet<KeychainKind, ConfirmationTimeHeightAnchor>> =
-            change_set.map(|cs| cs.0.clone());
-        let wallet: BdkWallet =
-            BdkWallet::new_or_load(&descriptor, &change_descriptor, change_set, network)?;
+        let mut persist_lock = persister.inner.lock().unwrap();
+        let deref = persist_lock.deref_mut();
+
+        let wallet: PersistedWallet<PersistenceType> = BdkWallet::load()
+            .descriptor(KeychainKind::External, Some(descriptor))
+            .descriptor(KeychainKind::Internal, Some(change_descriptor))
+            .extract_keys()
+            .load_wallet(deref)
+            .map_err(|e| LoadWithPersistError::Persist {
+                error_message: e.to_string(),
+            })?
+            .ok_or(LoadWithPersistError::CouldNotLoad)?;
 
         Ok(Wallet {
             inner_mutex: Mutex::new(wallet),
         })
     }
 
-    pub(crate) fn get_wallet(&self) -> MutexGuard<BdkWallet> {
-        self.inner_mutex.lock().expect("wallet")
+    /// Finds how the wallet derived the script pubkey `spk`.
+    ///
+    /// Will only return `Some(_)` if the wallet has given out the spk.
+    pub fn derivation_of_spk(&self, spk: Arc<Script>) -> Option<KeychainAndIndex> {
+        self.get_wallet()
+            .derivation_of_spk(spk.0.clone())
+            .map(|(k, i)| KeychainAndIndex {
+                keychain: k,
+                index: i,
+            })
     }
 
-    pub fn reveal_next_address(&self, keychain_kind: KeychainKind) -> AddressInfo {
-        self.get_wallet().reveal_next_address(keychain_kind).into()
+    /// Informs the wallet that you no longer intend to broadcast a tx that was built from it.
+    ///
+    /// This frees up the change address used when creating the tx for use in future transactions.
+    pub fn cancel_tx(&self, tx: &Transaction) {
+        self.get_wallet().cancel_tx(&tx.into())
     }
 
+    /// Returns the utxo owned by this wallet corresponding to `outpoint` if it exists in the
+    /// wallet's database.
+    pub fn get_utxo(&self, op: OutPoint) -> Option<LocalOutput> {
+        self.get_wallet()
+            .get_utxo(op.into())
+            .map(|local_output| local_output.into())
+    }
+
+    /// Attempt to reveal the next address of the given `keychain`.
+    ///
+    /// This will increment the keychain's derivation index. If the keychain's descriptor doesn't
+    /// contain a wildcard or every address is already revealed up to the maximum derivation
+    /// index defined in [BIP32](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki),
+    /// then the last revealed address will be returned.
+    pub fn reveal_next_address(&self, keychain: KeychainKind) -> AddressInfo {
+        self.get_wallet().reveal_next_address(keychain).into()
+    }
+
+    /// Peek an address of the given `keychain` at `index` without revealing it.
+    ///
+    /// For non-wildcard descriptors this returns the same address at every provided index.
+    ///
+    /// # Panics
+    ///
+    /// This panics when the caller requests for an address of derivation index greater than the
+    /// [BIP32](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki) max index.
+    pub fn peek_address(&self, keychain: KeychainKind, index: u32) -> AddressInfo {
+        self.get_wallet().peek_address(keychain, index).into()
+    }
+
+    /// The index of the next address that you would get if you were to ask the wallet for a new
+    /// address.
+    pub fn next_derivation_index(&self, keychain: KeychainKind) -> u32 {
+        self.get_wallet().next_derivation_index(keychain)
+    }
+
+    /// Get the next unused address for the given `keychain`, i.e. the address with the lowest
+    /// derivation index that hasn't been used in a transaction.
+    ///
+    /// This will attempt to reveal a new address if all previously revealed addresses have
+    /// been used, in which case the returned address will be the same as calling [`Wallet::reveal_next_address`].
+    ///
+    /// **WARNING**: To avoid address reuse you must persist the changes resulting from one or more
+    /// calls to this method before closing the wallet. See [`Wallet::reveal_next_address`].
+    pub fn next_unused_address(&self, keychain: KeychainKind) -> AddressInfo {
+        self.get_wallet().next_unused_address(keychain).into()
+    }
+
+    /// Marks an address used of the given `keychain` at `index`.
+    ///
+    /// Returns whether the given index was present and then removed from the unused set.
+    pub fn mark_used(&self, keychain: KeychainKind, index: u32) -> bool {
+        self.get_wallet().mark_used(keychain, index)
+    }
+
+    /// Reveal addresses up to and including the target `index` and return an iterator
+    /// of newly revealed addresses.
+    ///
+    /// If the target `index` is unreachable, we make a best effort to reveal up to the last
+    /// possible index. If all addresses up to the given `index` are already revealed, then
+    /// no new addresses are returned.
+    ///
+    /// **WARNING**: To avoid address reuse you must persist the changes resulting from one or more
+    /// calls to this method before closing the wallet. See [`Wallet::reveal_next_address`].
+    pub fn reveal_addresses_to(&self, keychain: KeychainKind, index: u32) -> Vec<AddressInfo> {
+        self.get_wallet()
+            .reveal_addresses_to(keychain, index)
+            .map(|address_info| address_info.into())
+            .collect()
+    }
+
+    /// List addresses that are revealed but unused.
+    ///
+    /// Note if the returned iterator is empty you can reveal more addresses
+    /// by using [`reveal_next_address`](Self::reveal_next_address) or
+    /// [`reveal_addresses_to`](Self::reveal_addresses_to).
+    pub fn list_unused_addresses(&self, keychain: KeychainKind) -> Vec<AddressInfo> {
+        self.get_wallet()
+            .list_unused_addresses(keychain)
+            .map(|address_info| address_info.into())
+            .collect()
+    }
+
+    /// Applies an update to the wallet and stages the changes (but does not persist them).
+    ///
+    /// Usually you create an `update` by interacting with some blockchain data source and inserting
+    /// transactions related to your wallet into it.
+    ///
+    /// After applying updates you should persist the staged wallet changes. For an example of how
+    /// to persist staged wallet changes see [`Wallet::reveal_next_address`].
     pub fn apply_update(&self, update: Arc<Update>) -> Result<(), CannotConnectError> {
         self.get_wallet()
             .apply_update(update.0.clone())
             .map_err(CannotConnectError::from)
     }
 
+    /// Apply relevant unconfirmed transactions to the wallet.
+    /// Transactions that are not relevant are filtered out.
+    pub fn apply_unconfirmed_txs(&self, unconfirmed_txs: Vec<UnconfirmedTx>) {
+        self.get_wallet().apply_unconfirmed_txs(
+            unconfirmed_txs
+                .into_iter()
+                .map(|utx| (Arc::new(utx.tx.as_ref().into()), utx.last_seen)),
+        )
+    }
+
+    /// The derivation index of this wallet. It will return `None` if it has not derived any addresses.
+    /// Otherwise, it will return the index of the highest address it has derived.
+    pub fn derivation_index(&self, keychain: KeychainKind) -> Option<u32> {
+        self.get_wallet().derivation_index(keychain)
+    }
+
+    /// Return the checksum of the public descriptor associated to `keychain`.
+    ///
+    /// Internally calls [`Self::public_descriptor`] to fetch the right descriptor.
+    pub fn descriptor_checksum(&self, keychain: KeychainKind) -> String {
+        self.get_wallet().descriptor_checksum(keychain)
+    }
+
+    /// Return the spending policies for the wallet’s descriptor.
+    pub fn policies(&self, keychain: KeychainKind) -> Result<Option<Arc<Policy>>, DescriptorError> {
+        self.get_wallet()
+            .policies(keychain)
+            .map_err(DescriptorError::from)
+            .map(|e| e.map(|p| Arc::new(p.into())))
+    }
+
+    /// Get the Bitcoin network the wallet is using.
     pub fn network(&self) -> Network {
         self.get_wallet().network()
     }
 
+    /// Return the balance, separated into available, trusted-pending, untrusted-pending and
+    /// immature values.
     pub fn balance(&self) -> Balance {
         let bdk_balance = self.get_wallet().balance();
         Balance::from(bdk_balance)
     }
 
-    pub fn is_mine(&self, script: &Script) -> bool {
-        self.get_wallet().is_mine(&script.0)
+    /// Return whether or not a `script` is part of this wallet (either internal or external).
+    pub fn is_mine(&self, script: Arc<Script>) -> bool {
+        self.get_wallet().is_mine(script.0.clone())
     }
 
-    pub(crate) fn sign(
+    /// Sign a transaction with all the wallet's signers, in the order specified by every signer's
+    /// [`SignerOrdering`]. This function returns the `Result` type with an encapsulated `bool` that
+    /// has the value true if the PSBT was finalized, or false otherwise.
+    ///
+    /// The [`SignOptions`] can be used to tweak the behavior of the software signers, and the way
+    /// the transaction is finalized at the end. Note that it can't be guaranteed that *every*
+    /// signers will follow the options, but the "software signers" (WIF keys and `xprv`) defined
+    /// in this library will.
+    #[uniffi::method(default(sign_options = None))]
+    pub fn sign(
         &self,
         psbt: Arc<Psbt>,
-        // sign_options: Option<SignOptions>,
+        sign_options: Option<SignOptions>,
     ) -> Result<bool, SignerError> {
         let mut psbt = psbt.0.lock().unwrap();
+        let bdk_sign_options: BdkSignOptions = match sign_options {
+            Some(sign_options) => BdkSignOptions::from(sign_options),
+            None => BdkSignOptions::default(),
+        };
+
         self.get_wallet()
-            .sign(&mut psbt, SignOptions::default())
+            .sign(&mut psbt, bdk_sign_options)
             .map_err(SignerError::from)
     }
 
+    /// Finalize a PSBT, i.e., for each input determine if sufficient data is available to pass
+    /// validation and construct the respective `scriptSig` or `scriptWitness`. Please refer to
+    /// [BIP174](https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#Input_Finalizer),
+    /// and [BIP371](https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki)
+    /// for further information.
+    ///
+    /// Returns `true` if the PSBT could be finalized, and `false` otherwise.
+    ///
+    /// The [`SignOptions`] can be used to tweak the behavior of the finalizer.
+    #[uniffi::method(default(sign_options = None))]
+    pub fn finalize_psbt(
+        &self,
+        psbt: Arc<Psbt>,
+        sign_options: Option<SignOptions>,
+    ) -> Result<bool, SignerError> {
+        let mut psbt = psbt.0.lock().unwrap();
+        let bdk_sign_options: BdkSignOptions = match sign_options {
+            Some(sign_options) => BdkSignOptions::from(sign_options),
+            None => BdkSignOptions::default(),
+        };
+
+        self.get_wallet()
+            .finalize_psbt(&mut psbt, bdk_sign_options)
+            .map_err(SignerError::from)
+    }
+
+    /// Compute the `tx`'s sent and received [`Amount`]s.
+    ///
+    /// This method returns a tuple `(sent, received)`. Sent is the sum of the txin amounts
+    /// that spend from previous txouts tracked by this wallet. Received is the summation
+    /// of this tx's outputs that send to script pubkeys tracked by this wallet.
     pub fn sent_and_received(&self, tx: &Transaction) -> SentAndReceivedValues {
         let (sent, received) = self.get_wallet().sent_and_received(&tx.into());
         SentAndReceivedValues {
@@ -108,19 +323,34 @@ impl Wallet {
         }
     }
 
+    /// Iterate over the transactions in the wallet.
     pub fn transactions(&self) -> Vec<CanonicalTx> {
         self.get_wallet()
-            .transactions()
+            .transactions_sort_by(|tx1, tx2| tx2.chain_position.cmp(&tx1.chain_position))
+            .into_iter()
             .map(|tx| tx.into())
             .collect()
     }
 
-    pub fn get_tx(&self, txid: String) -> Result<Option<CanonicalTx>, TxidParseError> {
-        let txid =
-            Txid::from_str(txid.as_str()).map_err(|_| TxidParseError::InvalidTxid { txid })?;
-        Ok(self.get_wallet().get_tx(txid).map(|tx| tx.into()))
+    /// Get a single transaction from the wallet as a [`WalletTx`] (if the transaction exists).
+    ///
+    /// `WalletTx` contains the full transaction alongside meta-data such as:
+    /// * Blocks that the transaction is [`Anchor`]ed in. These may or may not be blocks that exist
+    ///   in the best chain.
+    /// * The [`ChainPosition`] of the transaction in the best chain - whether the transaction is
+    ///   confirmed or unconfirmed. If the transaction is confirmed, the anchor which proves the
+    ///   confirmation is provided. If the transaction is unconfirmed, the unix timestamp of when
+    ///   the transaction was last seen in the mempool is provided.
+    pub fn get_tx(&self, txid: Arc<Txid>) -> Result<Option<CanonicalTx>, TxidParseError> {
+        Ok(self.get_wallet().get_tx(txid.0).map(|tx| tx.into()))
     }
 
+    /// Calculates the fee of a given transaction. Returns [`Amount::ZERO`] if `tx` is a coinbase transaction.
+    ///
+    /// To calculate the fee for a [`Transaction`] with inputs not owned by this wallet you must
+    /// manually insert the TxOut(s) into the tx graph using the [`insert_txout`] function.
+    ///
+    /// Note `tx` does not have to be in the graph for this to work.
     pub fn calculate_fee(&self, tx: &Transaction) -> Result<Arc<Amount>, CalculateFeeError> {
         self.get_wallet()
             .calculate_fee(&tx.into())
@@ -129,6 +359,12 @@ impl Wallet {
             .map_err(|e| e.into())
     }
 
+    /// Calculate the [`FeeRate`] for a given transaction.
+    ///
+    /// To calculate the fee rate for a [`Transaction`] with inputs not owned by this wallet you must
+    /// manually insert the TxOut(s) into the tx graph using the [`insert_txout`] function.
+    ///
+    /// Note `tx` does not have to be in the graph for this to work.
     pub fn calculate_fee_rate(&self, tx: &Transaction) -> Result<Arc<FeeRate>, CalculateFeeError> {
         self.get_wallet()
             .calculate_fee_rate(&tx.into())
@@ -136,591 +372,64 @@ impl Wallet {
             .map_err(|e| e.into())
     }
 
+    /// Return the list of unspent outputs of this wallet.
     pub fn list_unspent(&self) -> Vec<LocalOutput> {
         self.get_wallet().list_unspent().map(|o| o.into()).collect()
     }
 
+    /// List all relevant outputs (includes both spent and unspent, confirmed and unconfirmed).
+    ///
+    /// To list only unspent outputs (UTXOs), use [`Wallet::list_unspent`] instead.
     pub fn list_output(&self) -> Vec<LocalOutput> {
         self.get_wallet().list_output().map(|o| o.into()).collect()
     }
 
-    pub fn start_full_scan(&self) -> Arc<FullScanRequest> {
-        let request = self.get_wallet().start_full_scan();
-        Arc::new(FullScanRequest(Mutex::new(Some(request))))
+    /// Create a [`FullScanRequest] for this wallet.
+    ///
+    /// This is the first step when performing a spk-based wallet full scan, the returned
+    /// [`FullScanRequest] collects iterators for the wallet's keychain script pub keys needed to
+    /// start a blockchain full scan with a spk based blockchain client.
+    ///
+    /// This operation is generally only used when importing or restoring a previously used wallet
+    /// in which the list of used scripts is not known.
+    pub fn start_full_scan(&self) -> Arc<FullScanRequestBuilder> {
+        let builder = self.get_wallet().start_full_scan();
+        Arc::new(FullScanRequestBuilder(Mutex::new(Some(builder))))
     }
 
-    pub fn start_sync_with_revealed_spks(&self) -> Arc<SyncRequest> {
-        let request = self.get_wallet().start_sync_with_revealed_spks();
-        Arc::new(SyncRequest(Mutex::new(Some(request))))
+    /// Create a partial [`SyncRequest`] for this wallet for all revealed spks.
+    ///
+    /// This is the first step when performing a spk-based wallet partial sync, the returned
+    /// [`SyncRequest`] collects all revealed script pubkeys from the wallet keychain needed to
+    /// start a blockchain sync with a spk based blockchain client.
+    pub fn start_sync_with_revealed_spks(&self) -> Arc<SyncRequestBuilder> {
+        let builder = self.get_wallet().start_sync_with_revealed_spks();
+        Arc::new(SyncRequestBuilder(Mutex::new(Some(builder))))
     }
 
-    pub fn take_staged(&self) -> Option<Arc<ChangeSet>> {
+    /// Persist staged changes of wallet into persister.
+    ///
+    /// Returns whether any new changes were persisted.
+    ///
+    /// If the persister errors, the staged changes will not be cleared.
+    pub fn persist(&self, persister: Arc<Persister>) -> Result<bool, PersistenceError> {
+        let mut persist_lock = persister.inner.lock().unwrap();
+        let deref = persist_lock.deref_mut();
         self.get_wallet()
-            .take_staged()
-            .map(|change_set| Arc::new(change_set.into()))
+            .persist(deref)
+            .map_err(|e| PersistenceError::Reason {
+                error_message: e.to_string(),
+            })
+    }
+
+    /// Returns the latest checkpoint.
+    pub fn latest_checkpoint(&self) -> BlockId {
+        self.get_wallet().latest_checkpoint().block_id().into()
     }
 }
 
-pub struct SentAndReceivedValues {
-    pub sent: Arc<Amount>,
-    pub received: Arc<Amount>,
-}
-
-pub struct Update(pub(crate) BdkUpdate);
-
-#[derive(Clone, Debug)]
-pub struct TxBuilder {
-    pub(crate) recipients: Vec<(BdkScriptBuf, BdkAmount)>,
-    pub(crate) utxos: Vec<OutPoint>,
-    pub(crate) unspendable: HashSet<OutPoint>,
-    pub(crate) change_policy: ChangeSpendPolicy,
-    pub(crate) manually_selected_only: bool,
-    pub(crate) fee_rate: Option<FeeRate>,
-    pub(crate) fee_absolute: Option<Arc<Amount>>,
-    pub(crate) drain_wallet: bool,
-    pub(crate) drain_to: Option<BdkScriptBuf>,
-    pub(crate) rbf: Option<RbfValue>,
-    // pub(crate) data: Vec<u8>,
-}
-
-impl TxBuilder {
-    pub(crate) fn new() -> Self {
-        TxBuilder {
-            recipients: Vec::new(),
-            utxos: Vec::new(),
-            unspendable: HashSet::new(),
-            change_policy: ChangeSpendPolicy::ChangeAllowed,
-            manually_selected_only: false,
-            fee_rate: None,
-            fee_absolute: None,
-            drain_wallet: false,
-            drain_to: None,
-            rbf: None,
-            // data: Vec::new(),
-        }
-    }
-
-    pub(crate) fn add_recipient(&self, script: &Script, amount: Arc<Amount>) -> Arc<Self> {
-        let mut recipients: Vec<(BdkScriptBuf, BdkAmount)> = self.recipients.clone();
-        recipients.append(&mut vec![(script.0.clone(), amount.0)]);
-
-        Arc::new(TxBuilder {
-            recipients,
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn set_recipients(&self, recipients: Vec<ScriptAmount>) -> Arc<Self> {
-        let recipients = recipients
-            .iter()
-            .map(|script_amount| (script_amount.script.0.clone(), script_amount.amount.0)) //;
-            .collect();
-        Arc::new(TxBuilder {
-            recipients,
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn add_unspendable(&self, unspendable: OutPoint) -> Arc<Self> {
-        let mut unspendable_hash_set = self.unspendable.clone();
-        unspendable_hash_set.insert(unspendable);
-        Arc::new(TxBuilder {
-            unspendable: unspendable_hash_set,
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn unspendable(&self, unspendable: Vec<OutPoint>) -> Arc<Self> {
-        Arc::new(TxBuilder {
-            unspendable: unspendable.into_iter().collect(),
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn add_utxo(&self, outpoint: OutPoint) -> Arc<Self> {
-        self.add_utxos(vec![outpoint])
-    }
-
-    pub(crate) fn add_utxos(&self, mut outpoints: Vec<OutPoint>) -> Arc<Self> {
-        let mut utxos = self.utxos.to_vec();
-        utxos.append(&mut outpoints);
-        Arc::new(TxBuilder {
-            utxos,
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn change_policy(&self, change_policy: ChangeSpendPolicy) -> Arc<Self> {
-        Arc::new(TxBuilder {
-            change_policy,
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn do_not_spend_change(&self) -> Arc<Self> {
-        Arc::new(TxBuilder {
-            change_policy: ChangeSpendPolicy::ChangeForbidden,
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn only_spend_change(&self) -> Arc<Self> {
-        Arc::new(TxBuilder {
-            change_policy: ChangeSpendPolicy::OnlyChange,
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn manually_selected_only(&self) -> Arc<Self> {
-        Arc::new(TxBuilder {
-            manually_selected_only: true,
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn fee_rate(&self, fee_rate: &FeeRate) -> Arc<Self> {
-        Arc::new(TxBuilder {
-            fee_rate: Some(fee_rate.clone()),
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn fee_absolute(&self, fee_amount: Arc<Amount>) -> Arc<Self> {
-        Arc::new(TxBuilder {
-            fee_absolute: Some(fee_amount),
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn drain_wallet(&self) -> Arc<Self> {
-        Arc::new(TxBuilder {
-            drain_wallet: true,
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn drain_to(&self, script: &Script) -> Arc<Self> {
-        Arc::new(TxBuilder {
-            drain_to: Some(script.0.clone()),
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn enable_rbf(&self) -> Arc<Self> {
-        Arc::new(TxBuilder {
-            rbf: Some(RbfValue::Default),
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn enable_rbf_with_sequence(&self, nsequence: u32) -> Arc<Self> {
-        Arc::new(TxBuilder {
-            rbf: Some(RbfValue::Value(nsequence)),
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn finish(&self, wallet: &Arc<Wallet>) -> Result<Arc<Psbt>, CreateTxError> {
-        // TODO: I had to change the wallet here to be mutable. Why is that now required with the 1.0 API?
-        let mut wallet = wallet.get_wallet();
-        let mut tx_builder = wallet.build_tx();
-        for (script, amount) in &self.recipients {
-            tx_builder.add_recipient(script.clone(), *amount);
-        }
-        tx_builder.change_policy(self.change_policy);
-        if !self.utxos.is_empty() {
-            let bdk_utxos: Vec<BdkOutPoint> = self.utxos.iter().map(BdkOutPoint::from).collect();
-            tx_builder
-                .add_utxos(&bdk_utxos)
-                .map_err(CreateTxError::from)?;
-        }
-        if !self.unspendable.is_empty() {
-            let bdk_unspendable: Vec<BdkOutPoint> =
-                self.unspendable.iter().map(BdkOutPoint::from).collect();
-            tx_builder.unspendable(bdk_unspendable);
-        }
-        if self.manually_selected_only {
-            tx_builder.manually_selected_only();
-        }
-        if let Some(fee_rate) = &self.fee_rate {
-            tx_builder.fee_rate(fee_rate.0);
-        }
-        if let Some(fee_amount) = &self.fee_absolute {
-            tx_builder.fee_absolute(fee_amount.0);
-        }
-        if self.drain_wallet {
-            tx_builder.drain_wallet();
-        }
-        if let Some(script) = &self.drain_to {
-            tx_builder.drain_to(script.clone());
-        }
-        if let Some(rbf) = &self.rbf {
-            match *rbf {
-                RbfValue::Default => {
-                    tx_builder.enable_rbf();
-                }
-                RbfValue::Value(nsequence) => {
-                    tx_builder.enable_rbf_with_sequence(Sequence(nsequence));
-                }
-            }
-        }
-
-        let psbt = tx_builder.finish().map_err(CreateTxError::from)?;
-
-        Ok(Arc::new(psbt.into()))
+impl Wallet {
+    pub(crate) fn get_wallet(&self) -> MutexGuard<PersistedWallet<PersistenceType>> {
+        self.inner_mutex.lock().expect("wallet")
     }
 }
-
-#[derive(Clone)]
-pub(crate) struct BumpFeeTxBuilder {
-    pub(crate) txid: String,
-    pub(crate) fee_rate: Arc<FeeRate>,
-    pub(crate) rbf: Option<RbfValue>,
-}
-
-impl BumpFeeTxBuilder {
-    pub(crate) fn new(txid: String, fee_rate: Arc<FeeRate>) -> Self {
-        Self {
-            txid,
-            fee_rate,
-            rbf: None,
-        }
-    }
-
-    pub(crate) fn enable_rbf(&self) -> Arc<Self> {
-        Arc::new(Self {
-            rbf: Some(RbfValue::Default),
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn enable_rbf_with_sequence(&self, nsequence: u32) -> Arc<Self> {
-        Arc::new(Self {
-            rbf: Some(RbfValue::Value(nsequence)),
-            ..self.clone()
-        })
-    }
-
-    pub(crate) fn finish(&self, wallet: &Wallet) -> Result<Arc<Psbt>, CreateTxError> {
-        let txid = Txid::from_str(self.txid.as_str()).map_err(|_| CreateTxError::UnknownUtxo {
-            outpoint: self.txid.clone(),
-        })?;
-        let mut wallet = wallet.get_wallet();
-        let mut tx_builder = wallet.build_fee_bump(txid).map_err(CreateTxError::from)?;
-        tx_builder.fee_rate(self.fee_rate.0);
-        if let Some(rbf) = &self.rbf {
-            match *rbf {
-                RbfValue::Default => {
-                    tx_builder.enable_rbf();
-                }
-                RbfValue::Value(nsequence) => {
-                    tx_builder.enable_rbf_with_sequence(Sequence(nsequence));
-                }
-            }
-        }
-        let psbt: BdkPsbt = tx_builder.finish()?;
-
-        Ok(Arc::new(psbt.into()))
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum RbfValue {
-    Default,
-    Value(u32),
-}
-
-// #[cfg(test)]
-// mod test {
-//     use crate::database::DatabaseConfig;
-//     use crate::descriptor::Descriptor;
-//     use crate::keys::{DescriptorSecretKey, Mnemonic};
-//     use crate::wallet::{AddressIndex, TxBuilder, Wallet};
-//     use crate::Script;
-//     use assert_matches::assert_matches;
-//     use bdk::bitcoin::{Address, Network};
-//     // use bdk::wallet::get_funded_wallet;
-//     use bdk::KeychainKind;
-//     use std::str::FromStr;
-//     use std::sync::{Arc, Mutex};
-//
-//     // #[test]
-//     // fn test_drain_wallet() {
-//     //     let test_wpkh = "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)";
-//     //     let (funded_wallet, _, _) = get_funded_wallet(test_wpkh);
-//     //     let test_wallet = Wallet {
-//     //         inner_mutex: Mutex::new(funded_wallet),
-//     //     };
-//     //     let drain_to_address = "tb1ql7w62elx9ucw4pj5lgw4l028hmuw80sndtntxt".to_string();
-//     //     let drain_to_script = crate::Address::new(drain_to_address)
-//     //         .unwrap()
-//     //         .script_pubkey();
-//     //     let tx_builder = TxBuilder::new()
-//     //         .drain_wallet()
-//     //         .drain_to(drain_to_script.clone());
-//     //     assert!(tx_builder.drain_wallet);
-//     //     assert_eq!(tx_builder.drain_to, Some(drain_to_script.inner.clone()));
-//     //
-//     //     let tx_builder_result = tx_builder.finish(&test_wallet).unwrap();
-//     //     let psbt = tx_builder_result.psbt.inner.lock().unwrap().clone();
-//     //     let tx_details = tx_builder_result.transaction_details;
-//     //
-//     //     // confirm one input with 50,000 sats
-//     //     assert_eq!(psbt.inputs.len(), 1);
-//     //     let input_value = psbt
-//     //         .inputs
-//     //         .get(0)
-//     //         .cloned()
-//     //         .unwrap()
-//     //         .non_witness_utxo
-//     //         .unwrap()
-//     //         .output
-//     //         .get(0)
-//     //         .unwrap()
-//     //         .value;
-//     //     assert_eq!(input_value, 50_000_u64);
-//     //
-//     //     // confirm one output to correct address with all sats - fee
-//     //     assert_eq!(psbt.outputs.len(), 1);
-//     //     let output_address = Address::from_script(
-//     //         &psbt
-//     //             .unsigned_tx
-//     //             .output
-//     //             .get(0)
-//     //             .cloned()
-//     //             .unwrap()
-//     //             .script_pubkey,
-//     //         Network::Testnet,
-//     //     )
-//     //     .unwrap();
-//     //     assert_eq!(
-//     //         output_address,
-//     //         Address::from_str("tb1ql7w62elx9ucw4pj5lgw4l028hmuw80sndtntxt").unwrap()
-//     //     );
-//     //     let output_value = psbt.unsigned_tx.output.get(0).cloned().unwrap().value;
-//     //     assert_eq!(output_value, 49_890_u64); // input - fee
-//     //
-//     //     assert_eq!(
-//     //         tx_details.txid,
-//     //         "312f1733badab22dc26b8dcbc83ba5629fb7b493af802e8abe07d865e49629c5"
-//     //     );
-//     //     assert_eq!(tx_details.received, 0);
-//     //     assert_eq!(tx_details.sent, 50000);
-//     //     assert!(tx_details.fee.is_some());
-//     //     assert_eq!(tx_details.fee.unwrap(), 110);
-//     //     assert!(tx_details.confirmation_time.is_none());
-//     // }
-//
-//     #[test]
-//     fn test_peek_reset_address() {
-//         let test_wpkh = "wpkh(tprv8hwWMmPE4BVNxGdVt3HhEERZhondQvodUY7Ajyseyhudr4WabJqWKWLr4Wi2r26CDaNCQhhxEftEaNzz7dPGhWuKFU4VULesmhEfZYyBXdE/0/*)";
-//         let descriptor = Descriptor::new(test_wpkh.to_string(), Network::Regtest).unwrap();
-//         let change_descriptor = Descriptor::new(
-//             test_wpkh.to_string().replace("/0/*", "/1/*"),
-//             Network::Regtest,
-//         )
-//         .unwrap();
-//
-//         let wallet = Wallet::new(
-//             Arc::new(descriptor),
-//             Some(Arc::new(change_descriptor)),
-//             Network::Regtest,
-//             DatabaseConfig::Memory,
-//         )
-//         .unwrap();
-//
-//         assert_eq!(
-//             wallet
-//                 .get_address(AddressIndex::Peek { index: 2 })
-//                 .unwrap()
-//                 .address
-//                 .as_string(),
-//             "bcrt1q5g0mq6dkmwzvxscqwgc932jhgcxuqqkjv09tkj"
-//         );
-//
-//         assert_eq!(
-//             wallet
-//                 .get_address(AddressIndex::Peek { index: 1 })
-//                 .unwrap()
-//                 .address
-//                 .as_string(),
-//             "bcrt1q0xs7dau8af22rspp4klya4f7lhggcnqfun2y3a"
-//         );
-//
-//         // new index still 0
-//         assert_eq!(
-//             wallet
-//                 .get_address(AddressIndex::New)
-//                 .unwrap()
-//                 .address
-//                 .as_string(),
-//             "bcrt1qqjn9gky9mkrm3c28e5e87t5akd3twg6xezp0tv"
-//         );
-//
-//         // new index now 1
-//         assert_eq!(
-//             wallet
-//                 .get_address(AddressIndex::New)
-//                 .unwrap()
-//                 .address
-//                 .as_string(),
-//             "bcrt1q0xs7dau8af22rspp4klya4f7lhggcnqfun2y3a"
-//         );
-//
-//         // new index now 2
-//         assert_eq!(
-//             wallet
-//                 .get_address(AddressIndex::New)
-//                 .unwrap()
-//                 .address
-//                 .as_string(),
-//             "bcrt1q5g0mq6dkmwzvxscqwgc932jhgcxuqqkjv09tkj"
-//         );
-//
-//         // peek index 1
-//         assert_eq!(
-//             wallet
-//                 .get_address(AddressIndex::Peek { index: 1 })
-//                 .unwrap()
-//                 .address
-//                 .as_string(),
-//             "bcrt1q0xs7dau8af22rspp4klya4f7lhggcnqfun2y3a"
-//         );
-//
-//         // reset to index 0
-//         // assert_eq!(
-//         //     wallet
-//         //         .get_address(AddressIndex::Reset { index: 0 })
-//         //         .unwrap()
-//         //         .address
-//         //         .as_string(),
-//         //     "bcrt1qqjn9gky9mkrm3c28e5e87t5akd3twg6xezp0tv"
-//         // );
-//
-//         // new index 1 again
-//         assert_eq!(
-//             wallet
-//                 .get_address(AddressIndex::New)
-//                 .unwrap()
-//                 .address
-//                 .as_string(),
-//             "bcrt1q0xs7dau8af22rspp4klya4f7lhggcnqfun2y3a"
-//         );
-//     }
-//
-//     #[test]
-//     fn test_get_address() {
-//         let test_wpkh = "wpkh(tprv8hwWMmPE4BVNxGdVt3HhEERZhondQvodUY7Ajyseyhudr4WabJqWKWLr4Wi2r26CDaNCQhhxEftEaNzz7dPGhWuKFU4VULesmhEfZYyBXdE/0/*)";
-//         let descriptor = Descriptor::new(test_wpkh.to_string(), Network::Regtest).unwrap();
-//         let change_descriptor = Descriptor::new(
-//             test_wpkh.to_string().replace("/0/*", "/1/*"),
-//             Network::Regtest,
-//         )
-//         .unwrap();
-//
-//         let wallet = Wallet::new(
-//             Arc::new(descriptor),
-//             Some(Arc::new(change_descriptor)),
-//             Network::Regtest,
-//             DatabaseConfig::Memory,
-//         )
-//         .unwrap();
-//
-//         assert_eq!(
-//             wallet
-//                 .get_address(AddressIndex::New)
-//                 .unwrap()
-//                 .address
-//                 .as_string(),
-//             "bcrt1qqjn9gky9mkrm3c28e5e87t5akd3twg6xezp0tv"
-//         );
-//
-//         assert_eq!(
-//             wallet
-//                 .get_address(AddressIndex::New)
-//                 .unwrap()
-//                 .address
-//                 .as_string(),
-//             "bcrt1q0xs7dau8af22rspp4klya4f7lhggcnqfun2y3a"
-//         );
-//
-//         assert_eq!(
-//             wallet
-//                 .get_address(AddressIndex::LastUnused)
-//                 .unwrap()
-//                 .address
-//                 .as_string(),
-//             "bcrt1q0xs7dau8af22rspp4klya4f7lhggcnqfun2y3a"
-//         );
-//
-//         assert_eq!(
-//             wallet
-//                 .get_internal_address(AddressIndex::New)
-//                 .unwrap()
-//                 .address
-//                 .as_string(),
-//             "bcrt1qpmz73cyx00r4a5dea469j40ax6d6kqyd67nnpj"
-//         );
-//
-//         assert_eq!(
-//             wallet
-//                 .get_internal_address(AddressIndex::New)
-//                 .unwrap()
-//                 .address
-//                 .as_string(),
-//             "bcrt1qaux734vuhykww9632v8cmdnk7z2mw5lsf74v6k"
-//         );
-//
-//         assert_eq!(
-//             wallet
-//                 .get_internal_address(AddressIndex::LastUnused)
-//                 .unwrap()
-//                 .address
-//                 .as_string(),
-//             "bcrt1qaux734vuhykww9632v8cmdnk7z2mw5lsf74v6k"
-//         );
-//     }
-//
-//     #[test]
-//     fn test_is_mine() {
-//         // is_mine should return true for addresses generated by the wallet
-//         let mnemonic: Mnemonic = Mnemonic::from_string("chaos fabric time speed sponsor all flat solution wisdom trophy crack object robot pave observe combine where aware bench orient secret primary cable detect".to_string()).unwrap();
-//         let secret_key: DescriptorSecretKey =
-//             DescriptorSecretKey::new(Network::Testnet, Arc::new(mnemonic), None);
-//         let descriptor: Descriptor = Descriptor::new_bip84(
-//             Arc::new(secret_key),
-//             KeychainKind::External,
-//             Network::Testnet,
-//         );
-//         let wallet: Wallet = Wallet::new(
-//             Arc::new(descriptor),
-//             None,
-//             Network::Testnet,
-//             DatabaseConfig::Memory,
-//         )
-//         .unwrap();
-//
-//         // let address = wallet.get_address(AddressIndex::New).unwrap();
-//         // let script: Arc<Script> = address.address.script_pubkey();
-//
-//         // let is_mine_1: bool = wallet.is_mine(script).unwrap();
-//         // assert!(is_mine_1);
-//
-//         // is_mine returns false when provided a script that is not in the wallet
-//         let other_wpkh = "wpkh(tprv8hwWMmPE4BVNxGdVt3HhEERZhondQvodUY7Ajyseyhudr4WabJqWKWLr4Wi2r26CDaNCQhhxEftEaNzz7dPGhWuKFU4VULesmhEfZYyBXdE/0/*)";
-//         let other_descriptor = Descriptor::new(other_wpkh.to_string(), Network::Testnet).unwrap();
-//
-//         let other_wallet = Wallet::new(
-//             Arc::new(other_descriptor),
-//             None,
-//             Network::Testnet,
-//             DatabaseConfig::Memory,
-//         )
-//         .unwrap();
-//
-//         let other_address = other_wallet.get_address(AddressIndex::New).unwrap();
-//         let other_script: Arc<Script> = other_address.address.script_pubkey();
-//         let is_mine_2: bool = wallet.is_mine(other_script).unwrap();
-//         assert_matches!(is_mine_2, false);
-//     }
-// }

@@ -10,17 +10,17 @@ on:
       - "bdk-ffi/**"
       - "bdk-android/**"
 
-# The default Android NDK on the ubuntu-22.04 image is 25.2.9519653
+# The default Android NDK on the ubuntu-24.04 image is 25.2.9519653
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     steps:
       - name: "Show default version of NDK"
         run: echo $ANDROID_NDK_ROOT
 
       - name: "Check out PR branch"
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: "Cache"
         uses: actions/cache@v3
@@ -32,21 +32,15 @@ jobs:
           key: ${{ runner.os }}-${{ hashFiles('**/Cargo.toml','**/Cargo.lock') }}
 
       - name: "Set up JDK"
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
-      - name: "Set default Rust version to 1.77.1"
-        run: rustup default 1.77.1
-
-      - name: "Install Rust Android targets"
-        run: rustup target add x86_64-linux-android aarch64-linux-android armv7-linux-androideabi
-
       - name: "Build Android library"
         run: |
           cd bdk-android
-          ./gradlew buildAndroidLib --console=plain
+          bash ./scripts/build-linux-x86_64.sh
 
 # There are currently no unit tests for bdk-android (see the tests in bdk-jvm instead) and the 
 # integration tests require the macOS image which is not working with the older NDK version we

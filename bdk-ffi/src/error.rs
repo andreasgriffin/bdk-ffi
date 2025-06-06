@@ -1,30 +1,31 @@
-use crate::bitcoin::OutPoint;
-use crate::Network;
+use crate::OutPoint;
 
-use bdk_bitcoind_rpc::bitcoincore_rpc::bitcoin::address::ParseError;
+use bdk_core::bitcoin::script::PushBytesError;
 use bdk_electrum::electrum_client::Error as BdkElectrumError;
-use bdk_esplora::esplora_client::{Error as BdkEsploraError, Error};
-use bdk_sqlite::Error as BdkSqliteError;
-use bdk_wallet::bitcoin::address::FromScriptError as BdkFromScriptError;
+use bdk_esplora::esplora_client::Error as BdkEsploraError;
 use bdk_wallet::bitcoin::address::ParseError as BdkParseError;
+use bdk_wallet::bitcoin::address::{FromScriptError as BdkFromScriptError, ParseError};
 use bdk_wallet::bitcoin::amount::ParseAmountError as BdkParseAmountError;
 use bdk_wallet::bitcoin::bip32::Error as BdkBip32Error;
 use bdk_wallet::bitcoin::consensus::encode::Error as BdkEncodeError;
+use bdk_wallet::bitcoin::hashes::hex::HexToArrayError as BdkHexToArrayError;
+use bdk_wallet::bitcoin::hex::DisplayHex;
 use bdk_wallet::bitcoin::psbt::Error as BdkPsbtError;
 use bdk_wallet::bitcoin::psbt::ExtractTxError as BdkExtractTxError;
 use bdk_wallet::bitcoin::psbt::PsbtParseError as BdkPsbtParseError;
 use bdk_wallet::chain::local_chain::CannotConnectError as BdkCannotConnectError;
+use bdk_wallet::chain::rusqlite::Error as BdkSqliteError;
 use bdk_wallet::chain::tx_graph::CalculateFeeError as BdkCalculateFeeError;
 use bdk_wallet::descriptor::DescriptorError as BdkDescriptorError;
+use bdk_wallet::error::BuildFeeBumpError;
+use bdk_wallet::error::CreateTxError as BdkCreateTxError;
 use bdk_wallet::keys::bip39::Error as BdkBip39Error;
 use bdk_wallet::miniscript::descriptor::DescriptorKeyParseError as BdkDescriptorKeyParseError;
-use bdk_wallet::wallet::error::BuildFeeBumpError;
-use bdk_wallet::wallet::error::CreateTxError as BdkCreateTxError;
-use bdk_wallet::wallet::signer::SignerError as BdkSignerError;
-use bdk_wallet::wallet::tx_builder::AddUtxoError;
-use bdk_wallet::wallet::{NewError, NewOrLoadError};
-use bdk_wallet::KeychainKind;
-use bitcoin_internals::hex::display::DisplayHex;
+use bdk_wallet::miniscript::psbt::Error as BdkPsbtFinalizeError;
+use bdk_wallet::signer::SignerError as BdkSignerError;
+use bdk_wallet::tx_builder::AddUtxoError;
+use bdk_wallet::LoadWithPersistError as BdkLoadWithPersistError;
+use bdk_wallet::{chain, CreateWithPersistError as BdkCreateWithPersistError};
 
 use std::convert::TryInto;
 
@@ -120,7 +121,7 @@ pub enum Bip39Error {
     AmbiguousLanguages { languages: String },
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum CalculateFeeError {
     #[error("missing transaction output: {out_points:?}")]
     MissingTxOut { out_points: Vec<OutPoint> },
@@ -129,7 +130,7 @@ pub enum CalculateFeeError {
     NegativeFee { amount: String },
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum CannotConnectError {
     #[error("cannot include height: {height}")]
     Include { height: u32 },
@@ -155,11 +156,8 @@ pub enum CreateTxError {
     #[error("lock time conflict: requested {requested}, but required {required}")]
     LockTime { requested: String, required: String },
 
-    #[error("transaction requires rbf sequence number")]
-    RbfSequence,
-
-    #[error("rbf sequence: {rbf}, csv sequence: {csv}")]
-    RbfSequenceCsv { rbf: String, csv: String },
+    #[error("rbf sequence: {sequence}, csv sequence: {csv}")]
+    RbfSequenceCsv { sequence: String, csv: String },
 
     #[error("fee too low: required {required}")]
     FeeTooLow { required: String },
@@ -199,6 +197,24 @@ pub enum CreateTxError {
 
     #[error("miniscript psbt error: {error_message}")]
     MiniscriptPsbt { error_message: String },
+
+    #[error("attempt to prepare too many bytes to be pushed into script")]
+    PushBytesError,
+
+    #[error("invalid lock time value")]
+    LockTimeConversionError,
+}
+
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum CreateWithPersistError {
+    #[error("sqlite persistence error: {error_message}")]
+    Persist { error_message: String },
+
+    #[error("the wallet has already been created")]
+    DataAlreadyExists,
+
+    #[error("the loaded changeset cannot construct wallet: {error_message}")]
+    Descriptor { error_message: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -349,9 +365,12 @@ pub enum EsploraError {
 
     #[error("the request has already been consumed")]
     RequestAlreadyConsumed,
+
+    #[error("the server sent an invalid response")]
+    InvalidResponse,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum ExtractTxError {
     #[error("an absurdly high fee rate of {fee_rate} sat/vbyte")]
     AbsurdFeeRate { fee_rate: u64 },
@@ -367,7 +386,6 @@ pub enum ExtractTxError {
     )]
     OtherExtractTxErr,
 }
-
 #[derive(Debug, thiserror::Error)]
 pub enum FeeRateError {
     #[error("arithmetic overflow on feerate")]
@@ -391,9 +409,135 @@ pub enum FromScriptError {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum InspectError {
+pub enum RequestBuilderError {
     #[error("the request has already been consumed")]
     RequestAlreadyConsumed,
+}
+
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum LoadWithPersistError {
+    #[error("sqlite persistence error: {error_message}")]
+    Persist { error_message: String },
+
+    #[error("the loaded changeset cannot construct wallet: {error_message}")]
+    InvalidChangeSet { error_message: String },
+
+    #[error("could not load")]
+    CouldNotLoad,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MiniscriptError {
+    #[error("absolute locktime error")]
+    AbsoluteLockTime,
+
+    #[error("address error: {error_message}")]
+    AddrError { error_message: String },
+
+    #[error("p2sh address error: {error_message}")]
+    AddrP2shError { error_message: String },
+
+    #[error("analysis error: {error_message}")]
+    AnalysisError { error_message: String },
+
+    #[error("@ found outside of OR")]
+    AtOutsideOr,
+
+    #[error("bad descriptor: {error_message}")]
+    BadDescriptor { error_message: String },
+
+    #[error("bare descriptor address")]
+    BareDescriptorAddr,
+
+    #[error("too many keys in checkmultisig: {keys}")]
+    CmsTooManyKeys { keys: u32 },
+
+    #[error("context error: {error_message}")]
+    ContextError { error_message: String },
+
+    #[error("could not satisfy")]
+    CouldNotSatisfy,
+
+    #[error("expected character: {char}")]
+    ExpectedChar { char: String },
+
+    #[error("impossible satisfaction")]
+    ImpossibleSatisfaction,
+
+    #[error("invalid opcode")]
+    InvalidOpcode,
+
+    #[error("invalid push")]
+    InvalidPush,
+
+    #[error("lift error: {error_message}")]
+    LiftError { error_message: String },
+
+    #[error("maximum recursive depth exceeded")]
+    MaxRecursiveDepthExceeded,
+
+    #[error("missing signature")]
+    MissingSig,
+
+    #[error("too many keys in multi-a: {keys}")]
+    MultiATooManyKeys { keys: u64 },
+
+    #[error("multiple colons in fragment name")]
+    MultiColon,
+
+    #[error("multipath descriptor length mismatch")]
+    MultipathDescLenMismatch,
+
+    #[error("non-minimal verify: {error_message}")]
+    NonMinimalVerify { error_message: String },
+
+    #[error("non-standard bare script")]
+    NonStandardBareScript,
+
+    #[error("non top-level: {error_message}")]
+    NonTopLevel { error_message: String },
+
+    #[error("parse threshold error")]
+    ParseThreshold,
+
+    #[error("policy error: {error_message}")]
+    PolicyError { error_message: String },
+
+    #[error("pubkey context error")]
+    PubKeyCtxError,
+
+    #[error("relative locktime error")]
+    RelativeLockTime,
+
+    #[error("script error: {error_message}")]
+    Script { error_message: String },
+
+    #[error("secp256k1 error: {error_message}")]
+    Secp { error_message: String },
+
+    #[error("threshold error")]
+    Threshold,
+
+    #[error("no script code for taproot")]
+    TrNoScriptCode,
+
+    #[error("trailing data: {error_message}")]
+    Trailing { error_message: String },
+
+    #[error("type check error: {error_message}")]
+    TypeCheck { error_message: String },
+
+    #[error("unexpected: {error_message}")]
+    Unexpected { error_message: String },
+
+    #[error("unexpected start")]
+    UnexpectedStart,
+
+    #[error("unknown wrapper: {char}")]
+    UnknownWrapper { char: String },
+
+    #[error("unprintable character: {byte}")]
+    Unprintable { byte: u8 },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -420,8 +564,8 @@ pub enum ParseAmountError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
-    #[error("writing to persistence error: {error_message}")]
-    Write { error_message: String },
+    #[error("persistence error: {error_message}")]
+    Reason { error_message: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -538,6 +682,16 @@ pub enum PsbtParseError {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub enum PsbtFinalizeError {
+    #[error("an input at index {index} is invalid: {reason}")]
+    InputError { reason: String, index: u32 },
+    #[error("wrong input count; expected: {in_tx}, got: {in_map}")]
+    WrongInputCount { in_tx: u32, in_map: u32 },
+    #[error("input index out of bounds; inputs: {psbt_inp}, requested: {requested}")]
+    InputIdxOutofBounds { psbt_inp: u32, requested: u32 },
+}
+
+#[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum SignerError {
     #[error("missing key for signing")]
     MissingKey,
@@ -586,17 +740,9 @@ pub enum SignerError {
 
     #[error("external error: {error_message}")]
     External { error_message: String },
-}
 
-#[derive(Debug, thiserror::Error)]
-pub enum SqliteError {
-    // NOTE: This error is renamed from Network to InvalidNetwork to avoid conflict with the Network
-    //       enum in uniffi.
-    #[error("invalid network, cannot change the one already stored in the database")]
-    InvalidNetwork { expected: Network, given: Network },
-
-    #[error("SQLite error: {rusqlite_error}")]
-    Sqlite { rusqlite_error: String },
+    #[error("Psbt error: {error_message}")]
+    Psbt { error_message: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -624,33 +770,22 @@ pub enum TransactionError {
     OtherTransactionErr,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum TxidParseError {
     #[error("invalid txid: {txid}")]
     InvalidTxid { txid: String },
 }
 
-// This error combines the Rust bdk_wallet::wallet::NewError and bdk_wallet::wallet::NewOrLoadError
-#[derive(Debug, thiserror::Error)]
-pub enum WalletCreationError {
-    // From NewError and NewOrLoadError
-    #[error("error with descriptor: {error_message}")]
-    Descriptor { error_message: String },
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum CbfBuilderError {
+    #[error("the database could not be opened or created: {reason}")]
+    DatabaseError { reason: String },
+}
 
-    // From NewOrLoadError
-    #[error("loaded genesis hash '{got}' does not match the expected one '{expected}'")]
-    LoadedGenesisDoesNotMatch { expected: String, got: String },
-
-    // From NewOrLoadError
-    #[error("loaded network type is not {expected}, got {got:?}")]
-    LoadedNetworkDoesNotMatch {
-        expected: Network,
-        got: Option<Network>,
-    },
-
-    // From NewOrLoadError
-    #[error("loaded descriptor '{got}' does not match what was provided '{keychain:?}'")]
-    LoadedDescriptorDoesNotMatch { got: String, keychain: KeychainKind },
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum CbfError {
+    #[error("the node is no longer running")]
+    NodeStopped,
 }
 
 // ------------------------------------------------------------------------
@@ -782,9 +917,10 @@ impl From<BdkBip39Error> for Bip39Error {
 impl From<BdkCalculateFeeError> for CalculateFeeError {
     fn from(error: BdkCalculateFeeError) -> Self {
         match error {
-            BdkCalculateFeeError::MissingTxOut(out_points) => CalculateFeeError::MissingTxOut {
-                out_points: out_points.iter().map(|op| op.into()).collect(),
-            },
+            BdkCalculateFeeError::MissingTxOut(out_points) => {
+                let out_points = out_points.iter().map(OutPoint::from).collect();
+                CalculateFeeError::MissingTxOut { out_points }
+            }
             BdkCalculateFeeError::NegativeFee(signed_amount) => CalculateFeeError::NegativeFee {
                 amount: signed_amount.to_string(),
             },
@@ -823,9 +959,8 @@ impl From<BdkCreateTxError> for CreateTxError {
                 requested: requested.to_string(),
                 required: required.to_string(),
             },
-            BdkCreateTxError::RbfSequence => CreateTxError::RbfSequence,
-            BdkCreateTxError::RbfSequenceCsv { rbf, csv } => CreateTxError::RbfSequenceCsv {
-                rbf: rbf.to_string(),
+            BdkCreateTxError::RbfSequenceCsv { sequence, csv } => CreateTxError::RbfSequenceCsv {
+                sequence: sequence.to_string(),
                 csv: csv.to_string(),
             },
             BdkCreateTxError::FeeTooLow { required } => CreateTxError::FeeTooLow {
@@ -857,6 +992,29 @@ impl From<BdkCreateTxError> for CreateTxError {
             BdkCreateTxError::MiniscriptPsbt(e) => CreateTxError::MiniscriptPsbt {
                 error_message: e.to_string(),
             },
+        }
+    }
+}
+
+impl From<PushBytesError> for CreateTxError {
+    fn from(_: PushBytesError) -> Self {
+        CreateTxError::PushBytesError
+    }
+}
+
+impl From<BdkCreateWithPersistError<chain::rusqlite::Error>> for CreateWithPersistError {
+    fn from(error: BdkCreateWithPersistError<chain::rusqlite::Error>) -> Self {
+        match error {
+            BdkCreateWithPersistError::Persist(e) => CreateWithPersistError::Persist {
+                error_message: e.to_string(),
+            },
+            BdkCreateWithPersistError::Descriptor(e) => CreateWithPersistError::Descriptor {
+                error_message: e.to_string(),
+            },
+            // Objects cannot currently be used in enumerations
+            BdkCreateWithPersistError::DataAlreadyExists(_e) => {
+                CreateWithPersistError::DataAlreadyExists
+            }
         }
     }
 }
@@ -964,7 +1122,7 @@ impl From<BdkEsploraError> for EsploraError {
             BdkEsploraError::Parsing(e) => EsploraError::Parsing {
                 error_message: e.to_string(),
             },
-            Error::StatusCode(e) => EsploraError::StatusCode {
+            BdkEsploraError::StatusCode(e) => EsploraError::StatusCode {
                 error_message: e.to_string(),
             },
             BdkEsploraError::BitcoinEncoding(e) => EsploraError::BitcoinEncoding {
@@ -981,10 +1139,13 @@ impl From<BdkEsploraError> for EsploraError {
                 EsploraError::HeaderHeightNotFound { height }
             }
             BdkEsploraError::HeaderHashNotFound(_) => EsploraError::HeaderHashNotFound,
-            Error::InvalidHttpHeaderName(name) => EsploraError::InvalidHttpHeaderName { name },
+            BdkEsploraError::InvalidHttpHeaderName(name) => {
+                EsploraError::InvalidHttpHeaderName { name }
+            }
             BdkEsploraError::InvalidHttpHeaderValue(value) => {
                 EsploraError::InvalidHttpHeaderValue { value }
             }
+            BdkEsploraError::InvalidResponse => EsploraError::InvalidResponse,
         }
     }
 }
@@ -1002,7 +1163,7 @@ impl From<Box<BdkEsploraError>> for EsploraError {
             BdkEsploraError::Parsing(e) => EsploraError::Parsing {
                 error_message: e.to_string(),
             },
-            Error::StatusCode(e) => EsploraError::StatusCode {
+            BdkEsploraError::StatusCode(e) => EsploraError::StatusCode {
                 error_message: e.to_string(),
             },
             BdkEsploraError::BitcoinEncoding(e) => EsploraError::BitcoinEncoding {
@@ -1019,10 +1180,21 @@ impl From<Box<BdkEsploraError>> for EsploraError {
                 EsploraError::HeaderHeightNotFound { height }
             }
             BdkEsploraError::HeaderHashNotFound(_) => EsploraError::HeaderHashNotFound,
-            Error::InvalidHttpHeaderName(name) => EsploraError::InvalidHttpHeaderName { name },
+            BdkEsploraError::InvalidHttpHeaderName(name) => {
+                EsploraError::InvalidHttpHeaderName { name }
+            }
             BdkEsploraError::InvalidHttpHeaderValue(value) => {
                 EsploraError::InvalidHttpHeaderValue { value }
             }
+            BdkEsploraError::InvalidResponse => EsploraError::InvalidResponse,
+        }
+    }
+}
+
+impl From<BdkHexToArrayError> for EsploraError {
+    fn from(error: BdkHexToArrayError) -> Self {
+        EsploraError::Parsing {
+            error_message: error.to_string(),
         }
     }
 }
@@ -1058,6 +1230,104 @@ impl From<BdkFromScriptError> for FromScriptError {
     }
 }
 
+impl From<BdkLoadWithPersistError<chain::rusqlite::Error>> for LoadWithPersistError {
+    fn from(error: BdkLoadWithPersistError<chain::rusqlite::Error>) -> Self {
+        match error {
+            BdkLoadWithPersistError::Persist(e) => LoadWithPersistError::Persist {
+                error_message: e.to_string(),
+            },
+            BdkLoadWithPersistError::InvalidChangeSet(e) => {
+                LoadWithPersistError::InvalidChangeSet {
+                    error_message: e.to_string(),
+                }
+            }
+        }
+    }
+}
+
+impl From<BdkSqliteError> for PersistenceError {
+    fn from(error: BdkSqliteError) -> Self {
+        PersistenceError::Reason {
+            error_message: error.to_string(),
+        }
+    }
+}
+
+impl From<bdk_wallet::miniscript::Error> for MiniscriptError {
+    fn from(error: bdk_wallet::miniscript::Error) -> Self {
+        use bdk_wallet::miniscript::Error as BdkMiniscriptError;
+        match error {
+            BdkMiniscriptError::AbsoluteLockTime(_) => MiniscriptError::AbsoluteLockTime,
+            BdkMiniscriptError::AddrError(e) => MiniscriptError::AddrError {
+                error_message: e.to_string(),
+            },
+            BdkMiniscriptError::AddrP2shError(e) => MiniscriptError::AddrP2shError {
+                error_message: e.to_string(),
+            },
+            BdkMiniscriptError::AnalysisError(e) => MiniscriptError::AnalysisError {
+                error_message: e.to_string(),
+            },
+            BdkMiniscriptError::AtOutsideOr(_) => MiniscriptError::AtOutsideOr,
+            BdkMiniscriptError::BadDescriptor(s) => {
+                MiniscriptError::BadDescriptor { error_message: s }
+            }
+            BdkMiniscriptError::BareDescriptorAddr => MiniscriptError::BareDescriptorAddr,
+            BdkMiniscriptError::CmsTooManyKeys(n) => MiniscriptError::CmsTooManyKeys { keys: n },
+            BdkMiniscriptError::ContextError(e) => MiniscriptError::ContextError {
+                error_message: e.to_string(),
+            },
+            BdkMiniscriptError::CouldNotSatisfy => MiniscriptError::CouldNotSatisfy,
+            BdkMiniscriptError::ExpectedChar(c) => MiniscriptError::ExpectedChar {
+                char: c.to_string(),
+            },
+            BdkMiniscriptError::ImpossibleSatisfaction => MiniscriptError::ImpossibleSatisfaction,
+            BdkMiniscriptError::InvalidOpcode(_) => MiniscriptError::InvalidOpcode,
+            BdkMiniscriptError::InvalidPush(_) => MiniscriptError::InvalidPush,
+            BdkMiniscriptError::LiftError(e) => MiniscriptError::LiftError {
+                error_message: e.to_string(),
+            },
+            BdkMiniscriptError::MaxRecursiveDepthExceeded => {
+                MiniscriptError::MaxRecursiveDepthExceeded
+            }
+            BdkMiniscriptError::MissingSig(_) => MiniscriptError::MissingSig,
+            BdkMiniscriptError::MultiATooManyKeys(n) => {
+                MiniscriptError::MultiATooManyKeys { keys: n }
+            }
+            BdkMiniscriptError::MultiColon(_) => MiniscriptError::MultiColon,
+            BdkMiniscriptError::MultipathDescLenMismatch => {
+                MiniscriptError::MultipathDescLenMismatch
+            }
+            BdkMiniscriptError::NonMinimalVerify(s) => {
+                MiniscriptError::NonMinimalVerify { error_message: s }
+            }
+            BdkMiniscriptError::NonStandardBareScript => MiniscriptError::NonStandardBareScript,
+            BdkMiniscriptError::NonTopLevel(s) => MiniscriptError::NonTopLevel { error_message: s },
+            BdkMiniscriptError::ParseThreshold(_) => MiniscriptError::ParseThreshold,
+            BdkMiniscriptError::PolicyError(e) => MiniscriptError::PolicyError {
+                error_message: e.to_string(),
+            },
+            BdkMiniscriptError::PubKeyCtxError(_, _) => MiniscriptError::PubKeyCtxError,
+            BdkMiniscriptError::RelativeLockTime(_) => MiniscriptError::RelativeLockTime,
+            BdkMiniscriptError::Script(e) => MiniscriptError::Script {
+                error_message: e.to_string(),
+            },
+            BdkMiniscriptError::Secp(e) => MiniscriptError::Secp {
+                error_message: e.to_string(),
+            },
+            BdkMiniscriptError::Threshold(_) => MiniscriptError::Threshold,
+            BdkMiniscriptError::TrNoScriptCode => MiniscriptError::TrNoScriptCode,
+            BdkMiniscriptError::Trailing(s) => MiniscriptError::Trailing { error_message: s },
+            BdkMiniscriptError::TypeCheck(s) => MiniscriptError::TypeCheck { error_message: s },
+            BdkMiniscriptError::Unexpected(s) => MiniscriptError::Unexpected { error_message: s },
+            BdkMiniscriptError::UnexpectedStart => MiniscriptError::UnexpectedStart,
+            BdkMiniscriptError::UnknownWrapper(c) => MiniscriptError::UnknownWrapper {
+                char: c.to_string(),
+            },
+            BdkMiniscriptError::Unprintable(b) => MiniscriptError::Unprintable { byte: b },
+        }
+    }
+}
+
 impl From<BdkParseAmountError> for ParseAmountError {
     fn from(error: BdkParseAmountError) -> Self {
         match error {
@@ -1075,7 +1345,7 @@ impl From<BdkParseAmountError> for ParseAmountError {
 
 impl From<std::io::Error> for PersistenceError {
     fn from(error: std::io::Error) -> Self {
-        PersistenceError::Write {
+        PersistenceError::Reason {
             error_message: error.to_string(),
         }
     }
@@ -1165,6 +1435,29 @@ impl From<BdkPsbtParseError> for PsbtParseError {
     }
 }
 
+impl From<BdkPsbtFinalizeError> for PsbtFinalizeError {
+    fn from(value: BdkPsbtFinalizeError) -> Self {
+        match value {
+            BdkPsbtFinalizeError::InputError(input_error, index) => PsbtFinalizeError::InputError {
+                reason: input_error.to_string(),
+                index: index as u32,
+            },
+            BdkPsbtFinalizeError::WrongInputCount { in_tx, in_map } => {
+                PsbtFinalizeError::WrongInputCount {
+                    in_tx: in_tx as u32,
+                    in_map: in_map as u32,
+                }
+            }
+            BdkPsbtFinalizeError::InputIdxOutofBounds { psbt_inp, index } => {
+                PsbtFinalizeError::InputIdxOutofBounds {
+                    psbt_inp: psbt_inp as u32,
+                    requested: index as u32,
+                }
+            }
+        }
+    }
+}
+
 impl From<BdkSignerError> for SignerError {
     fn from(error: BdkSignerError) -> Self {
         match error {
@@ -1179,19 +1472,16 @@ impl From<BdkSignerError> for SignerError {
             BdkSignerError::MissingHdKeypath => SignerError::MissingHdKeypath,
             BdkSignerError::NonStandardSighash => SignerError::NonStandardSighash,
             BdkSignerError::InvalidSighash => SignerError::InvalidSighash,
-            BdkSignerError::SighashP2wpkh(e) => SignerError::SighashP2wpkh {
-                error_message: e.to_string(),
-            },
             BdkSignerError::SighashTaproot(e) => SignerError::SighashTaproot {
-                error_message: e.to_string(),
-            },
-            BdkSignerError::TxInputsIndexError(e) => SignerError::TxInputsIndexError {
                 error_message: e.to_string(),
             },
             BdkSignerError::MiniscriptPsbt(e) => SignerError::MiniscriptPsbt {
                 error_message: e.to_string(),
             },
             BdkSignerError::External(e) => SignerError::External { error_message: e },
+            BdkSignerError::Psbt(e) => SignerError::Psbt {
+                error_message: e.to_string(),
+            },
         }
     }
 }
@@ -1219,57 +1509,23 @@ impl From<BdkEncodeError> for TransactionError {
     }
 }
 
-impl From<BdkSqliteError> for SqliteError {
-    fn from(error: BdkSqliteError) -> Self {
-        match error {
-            BdkSqliteError::Network { expected, given } => {
-                SqliteError::InvalidNetwork { expected, given }
-            }
-            BdkSqliteError::Sqlite(e) => SqliteError::Sqlite {
-                rusqlite_error: e.to_string(),
-            },
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum HashParseError {
+    #[error("invalid hash: expected length 32 bytes, got {len} bytes")]
+    InvalidHash { len: u32 },
+}
+
+impl From<bdk_kyoto::builder::SqlInitializationError> for CbfBuilderError {
+    fn from(value: bdk_kyoto::builder::SqlInitializationError) -> Self {
+        CbfBuilderError::DatabaseError {
+            reason: value.to_string(),
         }
     }
 }
 
-impl From<bdk_sqlite::rusqlite::Error> for SqliteError {
-    fn from(error: bdk_sqlite::rusqlite::Error) -> Self {
-        SqliteError::Sqlite {
-            rusqlite_error: error.to_string(),
-        }
-    }
-}
-
-impl From<NewError> for WalletCreationError {
-    fn from(error: NewError) -> Self {
-        WalletCreationError::Descriptor {
-            error_message: error.to_string(),
-        }
-    }
-}
-
-impl From<NewOrLoadError> for WalletCreationError {
-    fn from(error: NewOrLoadError) -> Self {
-        match error {
-            NewOrLoadError::Descriptor(e) => WalletCreationError::Descriptor {
-                error_message: e.to_string(),
-            },
-            NewOrLoadError::LoadedGenesisDoesNotMatch { expected, got } => {
-                WalletCreationError::LoadedGenesisDoesNotMatch {
-                    expected: expected.to_string(),
-                    got: format!("{:?}", got),
-                }
-            }
-            NewOrLoadError::LoadedNetworkDoesNotMatch { expected, got } => {
-                WalletCreationError::LoadedNetworkDoesNotMatch { expected, got }
-            }
-            NewOrLoadError::LoadedDescriptorDoesNotMatch { got, keychain } => {
-                WalletCreationError::LoadedDescriptorDoesNotMatch {
-                    got: format!("{:?}", got),
-                    keychain,
-                }
-            }
-        }
+impl From<bdk_kyoto::kyoto::ClientError> for CbfError {
+    fn from(_value: bdk_kyoto::kyoto::ClientError) -> Self {
+        CbfError::NodeStopped
     }
 }
 
@@ -1279,12 +1535,12 @@ impl From<NewOrLoadError> for WalletCreationError {
 
 #[cfg(test)]
 mod test {
+    use crate::error::SignerError;
     use crate::error::{
         Bip32Error, Bip39Error, CannotConnectError, DescriptorError, DescriptorKeyError,
-        ElectrumError, EsploraError, ExtractTxError, FeeRateError, InspectError, PersistenceError,
-        PsbtError, PsbtParseError, TransactionError, TxidParseError,
+        ElectrumError, EsploraError, ExtractTxError, PsbtError, PsbtParseError,
+        RequestBuilderError, TransactionError, TxidParseError,
     };
-    use crate::SignerError;
 
     #[test]
     fn test_error_bip32() {
@@ -1656,47 +1912,11 @@ mod test {
     }
 
     #[test]
-    fn test_error_fee_rate() {
-        let cases = vec![(
-            FeeRateError::ArithmeticOverflow,
-            "arithmetic overflow on feerate",
-        )];
-
-        for (error, expected_message) in cases {
-            assert_eq!(error.to_string(), expected_message);
-        }
-    }
-
-    #[test]
     fn test_error_inspect() {
         let cases = vec![(
-            InspectError::RequestAlreadyConsumed,
+            RequestBuilderError::RequestAlreadyConsumed,
             "the request has already been consumed",
         )];
-
-        for (error, expected_message) in cases {
-            assert_eq!(error.to_string(), expected_message);
-        }
-    }
-
-    #[test]
-    fn test_persistence_error() {
-        let cases = vec![
-            (
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "unable to persist the new address",
-                )
-                .into(),
-                "writing to persistence error: unable to persist the new address",
-            ),
-            (
-                PersistenceError::Write {
-                    error_message: "failed to write to storage".to_string(),
-                },
-                "writing to persistence error: failed to write to storage",
-            ),
-        ];
 
         for (error, expected_message) in cases {
             assert_eq!(error.to_string(), expected_message);

@@ -8,9 +8,8 @@ plugins {
     id("org.jetbrains.kotlin.android")
     id("org.gradle.maven-publish")
     id("org.gradle.signing")
-
-    // Custom plugin to generate the native libs and bindings file
-    id("org.bitcoindevkit.plugins.generate-android-bindings")
+    id("org.jetbrains.dokka")
+    id("org.jetbrains.dokka-javadoc")
 }
 
 android {
@@ -19,7 +18,6 @@ android {
 
     defaultConfig {
         minSdk = 24
-        targetSdk = 34
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
     }
@@ -55,9 +53,9 @@ java {
 
 dependencies {
     implementation("net.java.dev.jna:jna:5.14.0@aar")
-    implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk7")
     implementation("androidx.appcompat:appcompat:1.4.0")
     implementation("androidx.core:core-ktx:1.7.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
     api("org.slf4j:slf4j-api:1.7.30")
 
     androidTestImplementation("com.github.tony19:logback-android:2.0.0")
@@ -106,15 +104,6 @@ afterEvaluate {
             }
         }
     }
-    
-    // This is required because we must ensure the moveNativeAndroidLibs task is executed after
-    // the mergeReleaseJniLibFolders (hard requirement introduced by our upgrade to Gradle 8.7)
-    tasks.named("mergeReleaseJniLibFolders") {
-        dependsOn(":lib:moveNativeAndroidLibs")
-    }
-    tasks.named("mergeDebugJniLibFolders") {
-        dependsOn(":lib:moveNativeAndroidLibs")
-    }
 }
 
 signing {
@@ -129,7 +118,20 @@ signing {
     sign(publishing.publications)
 }
 
-// This task dependency ensures that we build the bindings binaries before running the tests
-tasks.withType<KotlinCompile> {
-    dependsOn("buildAndroidLib")
+dokka {
+    moduleName.set("bdk-android")
+    moduleVersion.set(libraryVersion)
+    dokkaSourceSets.main {
+        includes.from("README.md")
+        sourceLink {
+            localDirectory.set(file("src/main/kotlin"))
+            remoteUrl("https://bitcoindevkit.org/")
+            remoteLineSuffix.set("#L")
+        }
+    }
+    pluginsConfiguration.html {
+        // customStyleSheets.from("styles.css")
+        // customAssets.from("logo.svg")
+        footerMessage.set("(c) Bitcoin Dev Kit Developers")
+    }
 }

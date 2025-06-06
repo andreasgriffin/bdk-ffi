@@ -43,17 +43,6 @@ interface Bip39Error {
 };
 
 [Error]
-interface CalculateFeeError {
-  MissingTxOut(sequence<OutPoint> out_points);
-  NegativeFee(string amount);
-};
-
-[Error]
-interface CannotConnectError {
-  Include(u32 height);
-};
-
-[Error]
 interface CreateTxError {
   Descriptor(string error_message);
   Policy(string error_message);
@@ -61,8 +50,7 @@ interface CreateTxError {
   Version0();
   Version1Csv();
   LockTime(string requested, string required);
-  RbfSequence();
-  RbfSequenceCsv(string rbf, string csv);
+  RbfSequenceCsv(string sequence, string csv);
   FeeTooLow(string required);
   FeeRateTooLow(string required);
   NoUtxosSelected();
@@ -76,6 +64,8 @@ interface CreateTxError {
   UnknownUtxo(string outpoint);
   MissingNonWitnessUtxo(string outpoint);
   MiniscriptPsbt(string error_message);
+  PushBytesError();
+  LockTimeConversionError();
 };
 
 [Error]
@@ -138,19 +128,12 @@ interface EsploraError {
   InvalidHttpHeaderName(string name);
   InvalidHttpHeaderValue(string value);
   RequestAlreadyConsumed();
+  InvalidResponse();
 };
 
 [Error]
-interface ExtractTxError {
-  AbsurdFeeRate(u64 fee_rate);
-  MissingInputValue();
-  SendingTooMuch();
-  OtherExtractTxErr();
-};
-
-[Error]
-enum FeeRateError {
-  "ArithmeticOverflow"
+interface FeeRateError {
+  ArithmeticOverflow();
 };
 
 [Error]
@@ -159,6 +142,47 @@ interface FromScriptError {
   WitnessProgram(string error_message);
   WitnessVersion(string error_message);
   OtherFromScriptErr();
+};
+
+[Error]
+interface MiniscriptError {
+    AbsoluteLockTime();
+    AddrError(string error_message);
+    AddrP2shError(string error_message);
+    AnalysisError(string error_message);
+    AtOutsideOr();
+    BadDescriptor(string error_message);
+    BareDescriptorAddr();
+    CmsTooManyKeys(u32 keys);
+    ContextError(string error_message);
+    CouldNotSatisfy();
+    ExpectedChar(string char);
+    ImpossibleSatisfaction();
+    InvalidOpcode();
+    InvalidPush();
+    LiftError(string error_message);
+    MaxRecursiveDepthExceeded();
+    MissingSig();
+    MultiATooManyKeys(u64 keys);
+    MultiColon();
+    MultipathDescLenMismatch();
+    NonMinimalVerify(string error_message);
+    NonStandardBareScript();
+    NonTopLevel(string error_message);
+    ParseThreshold();
+    PolicyError(string error_message);
+    PubKeyCtxError();
+    RelativeLockTime();
+    Script(string error_message);
+    Secp(string error_message);
+    Threshold();
+    TrNoScriptCode();
+    Trailing(string error_message);
+    TypeCheck(string error_message);
+    Unexpected(string error_message);
+    UnexpectedStart();
+    UnknownWrapper(string char);
+    Unprintable(u8 byte);
 };
 
 [Error]
@@ -173,7 +197,7 @@ interface ParseAmountError {
 
 [Error]
 interface PersistenceError {
-  Write(string error_message);
+  Reason(string error_message);
 };
 
 [Error]
@@ -220,34 +244,15 @@ interface PsbtParseError {
 };
 
 [Error]
-interface InspectError {
+interface PsbtFinalizeError {
+  InputError(string reason, u32 index);
+  WrongInputCount(u32 in_tx, u32 in_map);
+  InputIdxOutofBounds(u32 psbt_inp, u32 requested);
+};
+
+[Error]
+interface RequestBuilderError {
   RequestAlreadyConsumed();
-};
-
-[Error]
-interface SignerError {
-    MissingKey();
-    InvalidKey();
-    UserCanceled();
-    InputIndexOutOfRange();
-    MissingNonWitnessUtxo();
-    InvalidNonWitnessUtxo();
-    MissingWitnessUtxo();
-    MissingWitnessScript();
-    MissingHdKeypath();
-    NonStandardSighash();
-    InvalidSighash();
-    SighashP2wpkh(string error_message);
-    SighashTaproot(string error_message);
-    TxInputsIndexError(string error_message);
-    MiniscriptPsbt(string error_message);
-    External(string error_message);
-};
-
-[Error]
-interface SqliteError {
-  InvalidNetwork(Network expected, Network given);
-  Sqlite(string rusqlite_error);
 };
 
 [Error]
@@ -261,80 +266,33 @@ interface TransactionError {
   OtherTransactionErr();
 };
 
-[Error]
-interface TxidParseError {
-  InvalidTxid(string txid);
-};
-
-[Error]
-interface WalletCreationError {
-  Descriptor(string error_message);
-  LoadedGenesisDoesNotMatch(string expected, string got);
-  LoadedNetworkDoesNotMatch(Network expected, Network? got);
-  LoadedDescriptorDoesNotMatch(string got, KeychainKind keychain);
-};
-
 // ------------------------------------------------------------------------
 // bdk_wallet crate - types module
 // ------------------------------------------------------------------------
 
-enum KeychainKind {
-  "External",
-  "Internal",
+typedef enum KeychainKind;
+
+/// Builds a [`FullScanRequest`].
+interface FullScanRequestBuilder {
+  [Throws=RequestBuilderError]
+  FullScanRequestBuilder inspect_spks_for_all_keychains(FullScanScriptInspector inspector);
+
+  [Throws=RequestBuilderError]
+  FullScanRequest build();
 };
 
-dictionary AddressInfo {
-  u32 index;
-  Address address;
-  KeychainKind keychain;
+/// Builds a [`SyncRequest`].
+interface SyncRequestBuilder {
+  [Throws=RequestBuilderError]
+  SyncRequestBuilder inspect_spks(SyncScriptInspector inspector);
+
+  [Throws=RequestBuilderError]
+  SyncRequest build();
 };
 
-dictionary Balance {
-  Amount immature;
+interface FullScanRequest {};
 
-  Amount trusted_pending;
-
-  Amount untrusted_pending;
-
-  Amount confirmed;
-
-  Amount trusted_spendable;
-
-  Amount total;
-};
-
-dictionary LocalOutput {
-  OutPoint outpoint;
-  TxOut txout;
-  KeychainKind keychain;
-  boolean is_spent;
-};
-
-dictionary TxOut {
-  u64 value;
-  Script script_pubkey;
-};
-
-[Enum]
-interface ChainPosition {
-  Confirmed(u32 height, u64 timestamp);
-  Unconfirmed(u64 timestamp);
-};
-
-dictionary CanonicalTx {
-  Transaction transaction;
-  ChainPosition chain_position;
-};
-
-interface FullScanRequest {
-  [Throws=InspectError]
-  FullScanRequest inspect_spks_for_all_keychains(FullScanScriptInspector inspector);
-};
-
-interface SyncRequest {
-  [Throws=InspectError]
-  SyncRequest inspect_spks(SyncScriptInspector inspector);
-};
+interface SyncRequest {};
 
 [Trait, WithForeign]
 interface SyncScriptInspector {
@@ -346,279 +304,36 @@ interface FullScanScriptInspector {
   void inspect(KeychainKind keychain, u32 index, Script script);
 };
 
-interface ChangeSet {};
-
 // ------------------------------------------------------------------------
 // bdk_wallet crate - wallet module
 // ------------------------------------------------------------------------
 
-enum ChangeSpendPolicy {
-  "ChangeAllowed",
-  "OnlyChange",
-  "ChangeForbidden"
+typedef interface Policy;
+
+typedef enum SatisfiableItem;
+
+[Enum]
+interface PkOrF {
+  Pubkey(string value);
+  XOnlyPubkey(string value);
+  Fingerprint(string value);
 };
 
-interface Wallet {
-  [Throws=WalletCreationError]
-  constructor(Descriptor descriptor, Descriptor change_descriptor, Network network);
-
-  [Name=new_or_load, Throws=WalletCreationError]
-  constructor(Descriptor descriptor, Descriptor change_descriptor, ChangeSet? change_set, Network network);
-
-  AddressInfo reveal_next_address(KeychainKind keychain);
-
-  Network network();
-
-  Balance balance();
-
-  [Throws=CannotConnectError]
-  void apply_update(Update update);
-
-  boolean is_mine([ByRef] Script script);
-
-  [Throws=SignerError]
-  boolean sign(Psbt psbt);
-
-  SentAndReceivedValues sent_and_received([ByRef] Transaction tx);
-
-  sequence<CanonicalTx> transactions();
-
-  [Throws=TxidParseError]
-  CanonicalTx? get_tx(string txid);
-
-  [Throws=CalculateFeeError]
-  Amount calculate_fee([ByRef] Transaction tx);
-
-  [Throws=CalculateFeeError]
-  FeeRate calculate_fee_rate([ByRef] Transaction tx);
-
-  sequence<LocalOutput> list_unspent();
-
-  sequence<LocalOutput> list_output();
-
-  FullScanRequest start_full_scan();
-
-  SyncRequest start_sync_with_revealed_spks();
-
-  ChangeSet? take_staged();
+[Enum]
+interface LockTime {
+  Blocks(u32 height);
+  Seconds(u32 consensus_time);
 };
 
-interface Update {};
+typedef enum Satisfaction;
 
-interface TxBuilder {
-  constructor();
-
-  TxBuilder add_recipient([ByRef] Script script, Amount amount);
-
-  TxBuilder set_recipients(sequence<ScriptAmount> recipients);
-
-  TxBuilder add_unspendable(OutPoint unspendable);
-
-  TxBuilder unspendable(sequence<OutPoint> unspendable);
-
-  TxBuilder add_utxo(OutPoint outpoint);
-
-  TxBuilder change_policy(ChangeSpendPolicy change_policy);
-
-  TxBuilder do_not_spend_change();
-
-  TxBuilder only_spend_change();
-
-  TxBuilder manually_selected_only();
-
-  TxBuilder fee_rate([ByRef] FeeRate fee_rate);
-
-  TxBuilder fee_absolute(Amount fee);
-
-  TxBuilder drain_wallet();
-
-  TxBuilder drain_to([ByRef] Script script);
-
-  TxBuilder enable_rbf();
-
-  TxBuilder enable_rbf_with_sequence(u32 nsequence);
-
-  [Throws=CreateTxError]
-  Psbt finish([ByRef] Wallet wallet);
-};
-
-interface BumpFeeTxBuilder {
-  constructor(string txid, FeeRate fee_rate);
-
-  BumpFeeTxBuilder enable_rbf();
-
-  BumpFeeTxBuilder enable_rbf_with_sequence(u32 nsequence);
-
-  [Throws=CreateTxError]
-  Psbt finish([ByRef] Wallet wallet);
-};
-
-// ------------------------------------------------------------------------
-// bdk_sqlite crate
-// ------------------------------------------------------------------------
-
-interface SqliteStore {
-  [Throws=SqliteError]
-  constructor(string path);
-
-  [Throws=SqliteError]
-  void write([ByRef] ChangeSet change_set);
-
-  [Throws=SqliteError]
-  ChangeSet? read();
-};
-
-// ------------------------------------------------------------------------
-// bdk crate - descriptor module
-// ------------------------------------------------------------------------
-
-[Traits=(Display)]
-interface Mnemonic {
-  constructor(WordCount word_count);
-
-  [Name=from_string, Throws=Bip39Error]
-  constructor(string mnemonic);
-
-  [Name=from_entropy, Throws=Bip39Error]
-  constructor(sequence<u8> entropy);
-};
-
-interface DerivationPath {
-  [Throws=Bip32Error]
-  constructor(string path);
-};
-
-interface DescriptorSecretKey {
-  constructor(Network network, [ByRef] Mnemonic mnemonic, string? password);
-
-  [Name=from_string, Throws=DescriptorKeyError]
-  constructor(string secret_key);
-
-  [Throws=DescriptorKeyError]
-  DescriptorSecretKey derive([ByRef] DerivationPath path);
-
-  [Throws=DescriptorKeyError]
-  DescriptorSecretKey extend([ByRef] DerivationPath path);
-
-  DescriptorPublicKey as_public();
-
-  sequence<u8> secret_bytes();
-
-  string as_string();
-};
-
-interface DescriptorPublicKey {
-  [Name=from_string, Throws=DescriptorKeyError]
-  constructor(string public_key);
-
-  [Throws=DescriptorKeyError]
-  DescriptorPublicKey derive([ByRef] DerivationPath path);
-
-  [Throws=DescriptorKeyError]
-  DescriptorPublicKey extend([ByRef] DerivationPath path);
-
-  string as_string();
-};
-
-[Traits=(Display)]
-interface Descriptor {
-  [Throws=DescriptorError]
-  constructor(string descriptor, Network network);
-
-  [Name=new_bip44]
-  constructor([ByRef] DescriptorSecretKey secret_key, KeychainKind keychain, Network network);
-
-  [Name=new_bip44_public]
-  constructor([ByRef] DescriptorPublicKey public_key, string fingerprint, KeychainKind keychain, Network network);
-
-  [Name=new_bip49]
-  constructor([ByRef] DescriptorSecretKey secret_key, KeychainKind keychain, Network network);
-
-  [Name=new_bip49_public]
-  constructor([ByRef] DescriptorPublicKey public_key, string fingerprint, KeychainKind keychain, Network network);
-
-  [Name=new_bip84]
-  constructor([ByRef] DescriptorSecretKey secret_key, KeychainKind keychain, Network network);
-
-  [Name=new_bip84_public]
-  constructor([ByRef] DescriptorPublicKey public_key, string fingerprint, KeychainKind keychain, Network network);
-
-  [Name=new_bip86]
-  constructor([ByRef] DescriptorSecretKey secret_key, KeychainKind keychain, Network network);
-
-  [Name=new_bip86_public]
-  constructor([ByRef] DescriptorPublicKey public_key, string fingerprint, KeychainKind keychain, Network network);
-
-  string to_string_with_secret();
-};
-
-// ------------------------------------------------------------------------
-// bdk_esplora crate
-// ------------------------------------------------------------------------
-
-interface EsploraClient {
-  constructor(string url);
-
-  [Throws=EsploraError]
-  Update full_scan(FullScanRequest full_scan_request, u64 stop_gap, u64 parallel_requests);
-
-  [Throws=EsploraError]
-  Update sync(SyncRequest sync_request, u64 parallel_requests);
-
-  [Throws=EsploraError]
-  void broadcast([ByRef] Transaction transaction);
-};
-
-// ------------------------------------------------------------------------
-// bdk_electrum crate
-// ------------------------------------------------------------------------
-
-interface ElectrumClient {
-  [Throws=ElectrumError]
-  constructor(string url);
-
-  [Throws=ElectrumError]
-  Update full_scan(FullScanRequest full_scan_request, u64 stop_gap, u64 batch_size, boolean fetch_prev_txouts);
-
-  [Throws=ElectrumError]
-  Update sync(SyncRequest sync_request, u64 batch_size, boolean fetch_prev_txouts);
-
-  [Throws=ElectrumError]
-  string broadcast([ByRef] Transaction transaction);
-};
-
-// ------------------------------------------------------------------------
-// bdk-ffi-defined types
-// ------------------------------------------------------------------------
-
-dictionary ScriptAmount {
-  Script script;
-  Amount amount;
-};
-
-dictionary SentAndReceivedValues {
-    Amount sent;
-    Amount received;
-};
+typedef record Condition;
 
 // ------------------------------------------------------------------------
 // bdk_wallet crate - bitcoin re-exports
 // ------------------------------------------------------------------------
 
-interface Script {
-  constructor(sequence<u8> raw_output_script);
-
-  sequence<u8> to_bytes();
-};
-
-[NonExhaustive]
-enum Network {
-  "Bitcoin",
-  "Testnet",
-  "Signet",
-  "Regtest",
-};
-
+[Remote]
 enum WordCount {
   "Words12",
   "Words15",
@@ -627,102 +342,13 @@ enum WordCount {
   "Words24",
 };
 
-[Traits=(Display)]
-interface Address {
-  [Throws=AddressParseError]
-  constructor(string address, Network network);
+typedef interface Script;
 
-  [Name=from_script, Throws=FromScriptError]
-  constructor(Script script, Network network);
-
-  Script script_pubkey();
-
-  string to_qr_uri();
-
-  boolean is_valid_for_network(Network network);
-};
-
-interface Transaction {
-  [Throws=TransactionError]
-  constructor(sequence<u8> transaction_bytes);
-
-  string compute_txid();
-
-  u64 total_size();
-
-  u64 vsize();
-
-  boolean is_coinbase();
-
-  boolean is_explicitly_rbf();
-
-  boolean is_lock_time_enabled();
-
-  i32 version();
-
-  sequence<u8> serialize();
-
-  u64 weight();
-
-  sequence<TxIn> input();
-
-  sequence<TxOut> output();
-
-  u32 lock_time();
-};
-
-interface Psbt {
-  [Throws=PsbtParseError]
-  constructor(string psbt_base64);
-
-  string serialize();
-
-  [Throws=ExtractTxError]
-  Transaction extract_tx();
-
-  [Throws=PsbtError]
-  u64 fee();
-
-  [Throws=PsbtError]
-  Psbt combine(Psbt other);
-
-  string json_serialize();
-};
-
-dictionary OutPoint {
-  string txid;
-  u32 vout;
-};
-
-interface Amount {
-  [Name=from_sat]
-  constructor(u64 from_sat);
-
-  [Name=from_btc, Throws=ParseAmountError]
-  constructor(f64 from_btc);
-
-  u64 to_sat();
-
-  f64 to_btc();
-};
-
-interface FeeRate {
-  [Name=from_sat_per_vb, Throws=FeeRateError]
-  constructor(u64 sat_per_vb);
-
-  [Name=from_sat_per_kwu]
-  constructor(u64 sat_per_kwu);
-
-  u64 to_sat_per_vb_ceil();
-
-  u64 to_sat_per_vb_floor();
-
-  u64 to_sat_per_kwu();
-};
-
-dictionary TxIn {
-  OutPoint previous_output;
-  Script script_sig;
-  u32 sequence;
-  sequence<sequence<u8>> witness;
+[NonExhaustive, Remote]
+enum Network {
+  "Bitcoin",
+  "Testnet",
+  "Signet",
+  "Regtest",
+  "Testnet4",
 };
