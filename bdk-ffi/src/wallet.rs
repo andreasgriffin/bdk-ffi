@@ -216,6 +216,24 @@ impl Wallet {
         self.get_wallet().peek_address(keychain, index).into()
     }
 
+    /// Peek addresses of the given `keychain` in the range [`start_index`, `stop_index`] without
+    /// revealing them.
+    pub fn peek_address_batched(
+        &self,
+        keychain: KeychainKind,
+        start_index: u32,
+        stop_index: u32,
+    ) -> Vec<AddressInfo> {
+        if start_index > stop_index {
+            return Vec::new();
+        }
+
+        let wallet = self.get_wallet();
+        (start_index..=stop_index)
+            .map(|index| wallet.peek_address(keychain, index).into())
+            .collect()
+    }
+
     /// The index of the next address that you would get if you were to ask the wallet for a new
     /// address.
     pub fn next_derivation_index(&self, keychain: KeychainKind) -> u32 {
